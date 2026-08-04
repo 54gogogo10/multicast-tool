@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+venv/
+venv-*/
+.venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.spec.bak
+
+# Cached wheels / downloads
+wheels-*/
+wheels/
+*.whl
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
