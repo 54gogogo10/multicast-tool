@@ -14,14 +14,26 @@ import logging
 import random
 import socket
 import struct
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Optional, Union
+from typing import Callable, Optional
 
 from .stats import StatsTracker
 
 logger = logging.getLogger(__name__)
+
+# RFC 3678 SSM socket options. Windows' socket module does not export the
+# source-membership constants at all (Linux does), so fall back to the raw
+# Winsock / POSIX values: ws2ipdef.h defines IP_ADD_SOURCE_MEMBERSHIP=15,
+# IP_DROP_SOURCE_MEMBERSHIP=16, IPV6_JOIN_SOURCE_GROUP=30,
+# IPV6_LEAVE_SOURCE_GROUP=31. The ip_mreq_source / ipv6_mreq_source
+# layouts are identical on both platforms.
+IP_ADD_SOURCE_MEMBERSHIP = getattr(socket, "IP_ADD_SOURCE_MEMBERSHIP", 15)
+IP_DROP_SOURCE_MEMBERSHIP = getattr(socket, "IP_DROP_SOURCE_MEMBERSHIP", 16)
+IPV6_JOIN_GROUP = getattr(socket, "IPV6_JOIN_GROUP", 12)
+IPV6_LEAVE_GROUP = getattr(socket, "IPV6_LEAVE_GROUP", 13)
 
 
 # --------------------------------------------------------------------------- #
@@ -96,62 +108,289 @@ def interface_index(name_or_ip: str, family: AddressFamily) -> int:
     """Resolve a local interface name or IP to a numeric interface index.
 
     Empty string or 'auto' / 'default' returns 0 (kernel default).
-    Accepts both interface names (e.g. 'eth0', 'Wi-Fi') and IPs.
+    Accepts interface names (e.g. 'eth0', 'Wi-Fi', Windows display names)
+    and local interface IPs. Returns 0 when the input cannot be resolved;
+    callers that require an explicit interface treat 0 as an error.
     """
     s = (name_or_ip or "").strip()
     if not s or s.lower() in ("auto", "default", "*", "0"):
         return 0
-    # 1) Try direct name lookup
+    # 1) Direct name lookup (handles 'eth0', 'Wi-Fi', ...)
     try:
         idx = socket.if_nametoindex(s)
         if idx:
             return idx
     except (OSError, AttributeError):
         pass
-    # 2) Maybe the user passed an IP; find the interface that owns it and
-    #    resolve that name back to an index.
+    # 2) Maybe the user passed an IP or a display name; consult the table
+    ip_to_index, _name_to_ipv4, name_to_index = _iface_tables()[
+        0 if family is AddressFamily.IPV4 else 1
+    ]
+    return ip_to_index.get(s) or name_to_index.get(s) or 0
+
+
+def _resolve_ipv4_interface_address(spec: str) -> bytes:
+    """Resolve an interface name or IP to a 4-byte IPv4 address.
+
+    Used for ``ip_mreq``-style socket options that need an interface
+    *address* rather than an index. Raises ``ValueError`` (instead of
+    silently falling back to the default interface) when the spec cannot
+    be resolved.
+    """
+    s = spec.strip()
     try:
-        target = ipaddress.ip_address(s)
+        addr = ipaddress.ip_address(s)
     except ValueError:
-        return 0
-    name = _iface_name_for_ip(str(target), family)
-    if name:
-        try:
-            return socket.if_nametoindex(name)
-        except OSError:
-            return 0
-    return 0
+        addr = None
+    if isinstance(addr, ipaddress.IPv4Address):
+        return socket.inet_aton(s)
+    if addr is not None:
+        raise ValueError(f"interface {s!r} is not an IPv4 address")
+    ip = _iface_tables()[0][1].get(s)
+    if ip is None:
+        raise ValueError(
+            f"cannot resolve interface {s!r} to an IPv4 address; "
+            f"leave the interface empty for the system default"
+        )
+    return socket.inet_aton(ip)
+
+
+def _sa6_storage(addr_bin: bytes, scope: int = 0) -> bytes:
+    """sockaddr_in6 padded into a SOCKADDR_STORAGE-sized (128 byte) blob."""
+    sa = struct.pack("=HHI16sI", socket.AF_INET6, 0, 0, addr_bin, scope)
+    return sa + b"\x00" * (128 - len(sa))
 
 
 def _af(family: AddressFamily) -> int:
     return socket.AF_INET if family is AddressFamily.IPV4 else socket.AF_INET6
 
 
-def _iface_name_for_ip(ip: str, family: AddressFamily) -> Optional[str]:
-    """Best-effort lookup of an interface name that owns ``ip``.
+def _win_default_ipv6_ifindex() -> int:
+    """Best-effort default IPv6 interface index for Windows SSM joins.
 
-    Uses the UDP-probe trick to learn the local interface for a given
-    remote, then walks the interface list to find the matching name.
-    Falls back to ``None`` on platforms where the data is unavailable.
+    Winsock's ``IPV6_JOIN_SOURCE_GROUP`` rejects interface index 0 with
+    WSAEINVAL (unlike the IPv4 option, which accepts INADDR_ANY), so a
+    real interface is required. Prefer one with a global (non-link-local)
+    unicast address; fall back to any enumerated interface.
     """
-    af = _af(family)
-    # 1) Open a UDP socket, "connect" to a public IP so the kernel picks
-    #    a local source, then read getsockname() to find the local IP.
+    ip_to_index = _iface_tables()[1][0]
+    fallback = 0
+    for ip, index in ip_to_index.items():
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if not isinstance(addr, ipaddress.IPv6Address) or not index:
+            continue
+        if not (addr.is_link_local or addr.is_loopback or addr.is_multicast):
+            return index
+        if not fallback:
+            fallback = index
+    return fallback
+
+
+# --------------------------------------------------------------------------- #
+# Interface table (IP / name -> index / address)                              #
+# --------------------------------------------------------------------------- #
+
+# Per-family interface table: (ip_to_index, name_to_ipv4, name_to_index)
+#   ip_to_index:   local IP string -> interface index (for IPv6 socket options)
+#   name_to_ipv4:  interface display name -> first IPv4 address (for ip_mreq)
+#   name_to_index: interface display name -> interface index
+_IFACE_TABLES_LOCK = threading.Lock()
+_IFACE_TABLES: Optional[tuple[tuple[dict, dict, dict], tuple[dict, dict, dict]]] = None
+
+
+def _iface_tables() -> tuple[tuple[dict, dict, dict], tuple[dict, dict, dict]]:
+    """Return cached (IPv4, IPv6) interface tables.
+
+    The tables map local IPs and interface display names to the numeric
+    indexes and IPv4 addresses that multicast socket options need. They
+    are built once per process; on platforms without a known enumeration
+    method both tables are empty and callers fall back to the kernel
+    default interface.
+    """
+    global _IFACE_TABLES
+    with _IFACE_TABLES_LOCK:
+        if _IFACE_TABLES is None:
+            if sys.platform.startswith("win"):
+                _IFACE_TABLES = _win_iface_tables()
+            elif sys.platform.startswith("linux"):
+                _IFACE_TABLES = _linux_iface_tables()
+            else:
+                _IFACE_TABLES = (({}, {}, {}), ({}, {}, {}))
+        return _IFACE_TABLES
+
+
+def _win_iface_tables() -> tuple[tuple[dict, dict, dict], tuple[dict, dict, dict]]:
+    """Windows: enumerate adapters via GetAdaptersAddresses (ctypes)."""
+    v4: tuple[dict, dict, dict] = ({}, {}, {})
+    v6: tuple[dict, dict, dict] = ({}, {}, {})
     try:
-        with socket.socket(af, socket.SOCK_DGRAM) as s:
-            probe_host = "8.8.8.8" if family is AddressFamily.IPV4 else "2001:4860:4860::8888"
-            s.connect((probe_host, 80))
-            local = s.getsockname()[0]
+        import ctypes
+        from ctypes import wintypes
+
+        class _SockAddr(ctypes.Structure):
+            _fields_ = [("lpSockaddr", ctypes.c_void_p), ("iSockaddrLength", ctypes.c_int)]
+
+        class _Uca(ctypes.Structure):
+            pass
+
+        class _Aaa(ctypes.Structure):
+            pass
+
+        _Uca._fields_ = [
+            ("Length", wintypes.ULONG),
+            ("Flags", wintypes.DWORD),
+            ("Next", ctypes.POINTER(_Uca)),
+            ("Address", _SockAddr),
+            ("PrefixOrigin", wintypes.DWORD),
+            ("SuffixOrigin", wintypes.DWORD),
+            ("DadState", wintypes.DWORD),
+            ("ValidLifetime", wintypes.ULONG),
+            ("PreferredLifetime", wintypes.ULONG),
+            ("LeaseLifetime", wintypes.ULONG),
+            ("OnLinkPrefixLength", ctypes.c_ubyte),
+        ]
+        _Aaa._fields_ = [
+            ("Length", wintypes.ULONG),
+            ("IfIndex", wintypes.DWORD),
+            ("Next", ctypes.POINTER(_Aaa)),
+            ("AdapterName", ctypes.c_char_p),
+            ("FirstUnicastAddress", ctypes.POINTER(_Uca)),
+            ("FirstAnycastAddress", ctypes.c_void_p),
+            ("FirstMulticastAddress", ctypes.c_void_p),
+            ("FirstDnsServerAddress", ctypes.c_void_p),
+            ("DnsSuffix", ctypes.c_wchar_p),
+            ("Description", ctypes.c_wchar_p),
+            ("FriendlyName", ctypes.c_wchar_p),
+            ("PhysicalAddress", ctypes.c_ubyte * 8),
+            ("PhysicalAddressLength", wintypes.ULONG),
+            ("Flags", wintypes.DWORD),
+            ("Mtu", wintypes.DWORD),
+            ("IfType", wintypes.DWORD),
+            ("OperStatus", wintypes.DWORD),
+            ("Ipv6IfIndex", wintypes.DWORD),
+            ("ZoneIndices", wintypes.DWORD * 16),
+            ("FirstPrefix", ctypes.c_void_p),
+        ]
+
+        get_adapters = ctypes.windll.iphlpapi.GetAdaptersAddresses
+        get_adapters.restype = wintypes.ULONG
+        get_adapters.argtypes = [
+            wintypes.ULONG, wintypes.ULONG, ctypes.c_void_p,
+            ctypes.POINTER(_Aaa), ctypes.POINTER(wintypes.ULONG),
+        ]
+        # Skip anycast / multicast / DNS addresses; unicast is all we need.
+        flags = 0x2 | 0x4 | 0x8
+        buf_size = wintypes.ULONG(16 * 1024)
+        buf = None
+        rc = -1
+        for _ in range(4):
+            buf = ctypes.create_string_buffer(buf_size.value)
+            rc = get_adapters(
+                0, flags, None,
+                ctypes.cast(buf, ctypes.POINTER(_Aaa)), ctypes.byref(buf_size),
+            )
+            if rc == 0:  # NO_ERROR
+                break
+            if rc != 111:  # ERROR_BUFFER_OVERFLOW
+                return v4, v6
+        if rc != 0 or buf is None:
+            return v4, v6
+
+        idx_to_ipv4: dict[int, str] = {}
+        p = ctypes.cast(buf, ctypes.POINTER(_Aaa))
+        while p:
+            a = p.contents
+            name = a.FriendlyName or ""
+            idx_v4, idx_v6 = int(a.IfIndex), int(a.Ipv6IfIndex)
+            ua = a.FirstUnicastAddress
+            while ua:
+                u = ua.contents
+                sa = u.Address.lpSockaddr
+                if sa:
+                    fam = ctypes.c_ushort.from_address(sa).value
+                    if fam == socket.AF_INET:
+                        ip = socket.inet_ntop(socket.AF_INET, ctypes.string_at(sa + 4, 4))
+                        if idx_v4:
+                            v4[0][ip] = idx_v4
+                            idx_to_ipv4[idx_v4] = ip
+                        if name:
+                            v4[1].setdefault(name, ip)
+                    elif fam == socket.AF_INET6:
+                        ip = socket.inet_ntop(socket.AF_INET6, ctypes.string_at(sa + 8, 16))
+                        if idx_v6:
+                            v6[0][ip] = idx_v6
+                        if name:
+                            v6[2].setdefault(name, idx_v6)
+                ua = u.Next
+            if name:
+                if idx_v4:
+                    v4[2].setdefault(name, idx_v4)
+            p = a.Next
+
+        # Also accept the names socket.if_nameindex() reports (they differ
+        # from the display names on some Windows versions): map them via
+        # the shared index space.
+        try:
+            for cindex, cname in socket.if_nameindex():
+                try:
+                    cidx = socket.if_nametoindex(cname)
+                except OSError:
+                    continue
+                if cname not in v4[1] and cidx in idx_to_ipv4:
+                    v4[1][cname] = idx_to_ipv4[cidx]
+        except (OSError, AttributeError, TypeError):
+            pass
+    except Exception:  # noqa: BLE001 - never let enumeration break the app
+        logger.debug("GetAdaptersAddresses enumeration failed", exc_info=True)
+    return v4, v6
+
+
+def _linux_iface_tables() -> tuple[tuple[dict, dict, dict], tuple[dict, dict, dict]]:
+    """Linux: /proc/net/if_inet6 for IPv6, SIOCGIFADDR ioctl for IPv4."""
+    v4: tuple[dict, dict, dict] = ({}, {}, {})
+    v6: tuple[dict, dict, dict] = ({}, {}, {})
+    # IPv6: '<addr-hex> <ifindex-hex> <prefixlen> <scope> <flags> <name>'
+    try:
+        with open("/proc/net/if_inet6", encoding="ascii") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 6:
+                    continue
+                try:
+                    addr = ipaddress.IPv6Address(int(parts[0], 16))
+                    idx = int(parts[1], 16)
+                except ValueError:
+                    continue
+                if idx:
+                    v6[0][str(addr)] = idx
+                    v6[2].setdefault(parts[5], idx)
     except OSError:
-        return None
-    if family is AddressFamily.IPV6 and "%" in local:
-        local = local.split("%", 1)[0]
-    if local != ip:
-        return None
-    # 2) We know this IP is the system's primary outgoing IP, but the
-    #    kernel does not expose a portable "ip -> ifname" mapping in
-    #    stdlib. The caller can still use the IP as the interface.
-    return None
+        pass
+    # IPv4: SIOCGIFADDR per interface name
+    try:
+        import fcntl
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            for idx, name in socket.if_nameindex():
+                try:
+                    packed = fcntl.ioctl(
+                        s.fileno(), 0x8915, struct.pack("256s", name[:15].encode())
+                    )
+                except OSError:
+                    continue
+                ip = socket.inet_ntoa(packed[20:24])
+                v4[0][ip] = idx
+                v4[1].setdefault(name, ip)
+                v4[2].setdefault(name, idx)
+        finally:
+            s.close()
+    except (OSError, ImportError):
+        pass
+    return v4, v6
 
 
 def local_addresses(family: AddressFamily) -> list[str]:
@@ -288,9 +527,21 @@ class MulticastReceiver:
             raise ValueError(f"Not a valid {self.config.family.value} multicast address: {self.config.group!r}")
         if not (1 <= self.config.port <= 65535):
             raise ValueError(f"Port out of range: {self.config.port}")
-        # Validate source list (will raise on bad input)
+        # Validate source list (will raise on bad input). Sources must also
+        # match the address family of the group.
         for s in self.config.sources:
-            ipaddress.ip_address(s)  # raises on bad
+            try:
+                addr = ipaddress.ip_address(s)
+            except ValueError:
+                raise ValueError(f"Invalid source IP: {s!r}") from None
+            if self.config.family is AddressFamily.IPV4 and not isinstance(
+                addr, ipaddress.IPv4Address
+            ):
+                raise ValueError(f"Source {s!r} is not IPv4")
+            if self.config.family is AddressFamily.IPV6 and not isinstance(
+                addr, ipaddress.IPv6Address
+            ):
+                raise ValueError(f"Source {s!r} is not IPv6")
 
         sock = self._make_socket()
         try:
@@ -392,26 +643,22 @@ class MulticastReceiver:
     def _join_ipv4(self, sock: socket.socket) -> None:
         group_bin = socket.inet_aton(self.config.group)
         iface = self.config.interface.strip()
-        if_index = interface_index(iface, self.config.family) if iface else 0
-        # Resolve the local interface address used for membership reporting.
-        if iface and if_index == 0:
-            # Treat as an IP
-            try:
-                ipaddress.ip_address(iface)
-                ifaddr = socket.inet_aton(iface)
-            except ValueError:
-                # Not a valid IP -- fallback to INADDR_ANY
-                ifaddr = socket.inet_aton("0.0.0.0")
-        elif if_index:
-            ifaddr = socket.inet_aton("0.0.0.0")  # let kernel pick the right one
+        if iface and iface.lower() not in ("auto", "default", "*", "0"):
+            ifaddr = _resolve_ipv4_interface_address(iface)
         else:
             ifaddr = socket.inet_aton("0.0.0.0")
         if self.config.igmp_version is IgmpVersion.V3 and self.config.sources:
-            # IP_ADD_SOURCE_MEMBERSHIP (IGMPv3 SSM)
+            # IP_ADD_SOURCE_MEMBERSHIP (IGMPv3 SSM). NOTE: the two platforms
+            # define struct ip_mreq_source with DIFFERENT field order:
+            #   Linux  ip_mreq_source:  multiaddr, interface, sourceaddr
+            #   Win32  ip_mreq_source:  multiaddr, sourceaddr, interface
             for src in self.config.sources:
                 src_bin = socket.inet_aton(src)
-                mreq = struct.pack("!4s4s4s", group_bin, ifaddr, src_bin)
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_SOURCE_MEMBERSHIP, mreq)
+                if sys.platform.startswith("win"):
+                    mreq = struct.pack("!4s4s4s", group_bin, src_bin, ifaddr)
+                else:
+                    mreq = struct.pack("!4s4s4s", group_bin, ifaddr, src_bin)
+                sock.setsockopt(socket.IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, mreq)
         else:
             mreq = struct.pack("!4s4s", group_bin, ifaddr)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
@@ -419,19 +666,22 @@ class MulticastReceiver:
     def _leave_ipv4(self, sock: socket.socket) -> None:
         group_bin = socket.inet_aton(self.config.group)
         iface = self.config.interface.strip()
-        if iface:
+        if iface and iface.lower() not in ("auto", "default", "*", "0"):
             try:
-                ifaddr = socket.inet_aton(iface)
-            except OSError:
+                ifaddr = _resolve_ipv4_interface_address(iface)
+            except ValueError:
                 ifaddr = socket.inet_aton("0.0.0.0")
         else:
             ifaddr = socket.inet_aton("0.0.0.0")
         if self.config.igmp_version is IgmpVersion.V3 and self.config.sources:
             for src in self.config.sources:
                 src_bin = socket.inet_aton(src)
-                mreq = struct.pack("!4s4s4s", group_bin, ifaddr, src_bin)
+                if sys.platform.startswith("win"):
+                    mreq = struct.pack("!4s4s4s", group_bin, src_bin, ifaddr)
+                else:
+                    mreq = struct.pack("!4s4s4s", group_bin, ifaddr, src_bin)
                 try:
-                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_SOURCE_MEMBERSHIP, mreq)
+                    sock.setsockopt(socket.IPPROTO_IP, IP_DROP_SOURCE_MEMBERSHIP, mreq)
                 except OSError:
                     pass
         else:
@@ -442,37 +692,75 @@ class MulticastReceiver:
                 pass
 
     def _join_ipv6(self, sock: socket.socket) -> None:
-        # Resolve interface index (numeric)
+        # Resolve the interface to a numeric index (name, IP, or default).
+        # An explicitly requested interface that cannot be resolved is an
+        # error: silently joining on the default interface would be worse.
         iface = self.config.interface.strip()
-        idx = interface_index(iface, self.config.family) if iface else 0
+        if iface and iface.lower() not in ("auto", "default", "*", "0"):
+            idx = interface_index(iface, self.config.family)
+            if not idx:
+                raise ValueError(
+                    f"cannot resolve interface {iface!r} to an interface index; "
+                    f"leave the interface empty for the system default"
+                )
+        else:
+            idx = 0
+        if sys.platform.startswith("win") and idx == 0:
+            # Winsock IPV6_JOIN_SOURCE_GROUP requires a real interface index.
+            idx = _win_default_ipv6_ifindex()
+            if not idx:
+                raise ValueError(
+                    "no IPv6 interface found; pick one explicitly in the "
+                    "interface field"
+                )
         group_bin = socket.inet_pton(socket.AF_INET6, self.config.group)
         if self.config.mld_version is MldVersion.V2 and self.config.sources:
-            # IPV6_JOIN_SOURCE_GROUP (MLDv2 SSM)
+            # MLDv2 SSM. The option numbers differ between platforms, but
+            # the payload layout is IDENTICAL (RFC 3678 group_source_req,
+            # confirmed against ws2ipdef.h / linux uapi in.h):
+            #   { u32 ifindex, sockaddr_storage group, sockaddr_storage source }
+            # with 8-byte alignment for the storage members (4 pad bytes).
+            #   Winsock: MCAST_JOIN_SOURCE_GROUP (45) at IPPROTO_IPV6
+            #   Linux:   MCAST_JOIN_SOURCE_GROUP (46)
             for src in self.config.sources:
                 src_bin = socket.inet_pton(socket.AF_INET6, src)
-                # struct ipv6_mreq_source: 16s address, 4s index, 16s source_addr
-                mreq = group_bin + struct.pack("I", idx) + src_bin
-                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_SOURCE_GROUP, mreq)
+                if sys.platform.startswith("win"):
+                    opt = 45  # MCAST_JOIN_SOURCE_GROUP (Winsock)
+                else:
+                    opt = 46  # MCAST_JOIN_SOURCE_GROUP (Linux)
+                gsr = (struct.pack("I", idx) + b"\x00" * 4
+                       + _sa6_storage(group_bin)
+                       + _sa6_storage(src_bin))
+                sock.setsockopt(socket.IPPROTO_IPV6, opt, gsr)
         else:
             mreq = group_bin + struct.pack("I", idx)
-            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
+            sock.setsockopt(socket.IPPROTO_IPV6, IPV6_JOIN_GROUP, mreq)
 
     def _leave_ipv6(self, sock: socket.socket) -> None:
         iface = self.config.interface.strip()
         idx = interface_index(iface, self.config.family) if iface else 0
+        if sys.platform.startswith("win") and idx == 0:
+            idx = _win_default_ipv6_ifindex()
         group_bin = socket.inet_pton(socket.AF_INET6, self.config.group)
         if self.config.mld_version is MldVersion.V2 and self.config.sources:
             for src in self.config.sources:
                 src_bin = socket.inet_pton(socket.AF_INET6, src)
-                mreq = group_bin + struct.pack("I", idx) + src_bin
                 try:
-                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_LEAVE_SOURCE_GROUP, mreq)
+                    if sys.platform.startswith("win"):
+                        opt = 46  # MCAST_LEAVE_SOURCE_GROUP (Winsock)
+                    else:
+                        opt = 47  # MCAST_LEAVE_SOURCE_GROUP (Linux)
+                    # Same layout as the join above (RFC 3678 group_source_req).
+                    gsr = (struct.pack("I", idx) + b"\x00" * 4
+                           + _sa6_storage(group_bin)
+                           + _sa6_storage(src_bin))
+                    sock.setsockopt(socket.IPPROTO_IPV6, opt, gsr)
                 except OSError:
                     pass
         else:
             mreq = group_bin + struct.pack("I", idx)
             try:
-                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_LEAVE_GROUP, mreq)
+                sock.setsockopt(socket.IPPROTO_IPV6, IPV6_LEAVE_GROUP, mreq)
             except OSError:
                 pass
 
@@ -481,21 +769,26 @@ class MulticastReceiver:
         sock = self._sock
         while self._running.is_set():
             try:
-                data, addr = sock.recvfrom(65535)
+                data, _addr = sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except OSError as e:
                 if not self._running.is_set():
                     break
+                # A real receive error: mark the receiver stopped, close the
+                # socket and surface the error. is_running() must not stay
+                # True while the thread is gone.
                 self._error = str(e)
+                self._running.clear()
+                self._joined = False
+                self._sock = None
+                try:
+                    sock.close()
+                except OSError:
+                    pass
                 self._emit(ReceiverEventType.ERROR, f"recv error: {e}")
                 break
             self.stats.record(len(data))
-            self._emit(
-                ReceiverEventType.PACKET,
-                source_addr=addr[0] if addr else None,
-                n_bytes=len(data),
-            )
 
 
 # --------------------------------------------------------------------------- #
@@ -616,32 +909,30 @@ class MulticastSender:
         family = _af(self.config.family)
         sock = socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         if self.config.family is AddressFamily.IPV4:
-            # Set outgoing interface
+            # Set outgoing interface (IP_MULTICAST_IF wants an address)
             if self.config.source:
-                sock.setsockopt(
-                    socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
-                    socket.inet_aton(self.config.source),
-                )
+                ifaddr = _resolve_ipv4_interface_address(self.config.source)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, ifaddr)
             elif self.config.interface:
-                # If interface is an IP, use it
-                try:
-                    ipaddress.ip_address(self.config.interface)
-                    sock.setsockopt(
-                        socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
-                        socket.inet_aton(self.config.interface),
-                    )
-                except ValueError:
-                    pass
+                iface = self.config.interface.strip()
+                if iface.lower() not in ("auto", "default", "*", "0"):
+                    ifaddr = _resolve_ipv4_interface_address(iface)
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, ifaddr)
             # TTL
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, self.config.ttl)
             # Loopback enabled by default; leave as-is
         else:  # IPv6
             if self.config.source or self.config.interface:
-                # Convert to interface index
-                idx = interface_index(
-                    self.config.source or self.config.interface, self.config.family
-                )
-                if idx:
+                # Convert to interface index; unresolvable specs are an error
+                # (previously they were silently ignored).
+                spec = (self.config.source or self.config.interface).strip()
+                if spec.lower() not in ("auto", "default", "*", "0"):
+                    idx = interface_index(spec, self.config.family)
+                    if not idx:
+                        raise ValueError(
+                            f"cannot resolve interface {spec!r} to an interface index; "
+                            f"leave the interface empty for the system default"
+                        )
                     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, idx)
             # Hop Limit
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, self.config.ttl)
@@ -672,6 +963,7 @@ class MulticastSender:
         next_send = time.monotonic()
         progress_step = max(1, (target_count or 1000) // 100) if target_count else 100
         last_progress_sent = 0
+        last_progress_at = 0.0
         payload_len = len(payload)
 
         try:
@@ -687,8 +979,13 @@ class MulticastSender:
                 sent += 1
                 self._sent = sent
                 self.stats.record(payload_len)
-                if sent - last_progress_sent >= progress_step:
+                now = time.monotonic()
+                # Throttle progress events: at most one per 100 ms, so a
+                # high-rate continuous send cannot flood the GUI thread.
+                if (sent - last_progress_sent >= progress_step
+                        and now - last_progress_at >= 0.1):
                     last_progress_sent = sent
+                    last_progress_at = now
                     self._emit(
                         SenderEventType.PROGRESS, sent=sent, target=target_count or 0
                     )
@@ -696,6 +993,9 @@ class MulticastSender:
                     next_send += interval
                     sleep_for = next_send - time.monotonic()
                     if sleep_for > 0:
+                        # NB: single sleep() call. Slicing the wait (or using
+                        # Event.wait) makes Windows sleep a full 15.6 ms timer
+                        # quantum per call, which destroys pacing accuracy.
                         time.sleep(sleep_for)
                     else:
                         # We're behind schedule; reset to avoid drift burst

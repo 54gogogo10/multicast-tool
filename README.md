@@ -32,6 +32,8 @@ watch real-time receive statistics (packet count, byte count, pps, bps).
   stats, so a single dashboard shows both ends of the pipe.
 - **Chinese / English UI** — the whole interface is translated; switch
   languages live via *View → Language → 中文 / English*.
+- **Dark / light theme** — modern card-based interface with dashboard
+  stat tiles; switch via *View → Theme → 深色 / 浅色* (persisted).
 - **User-resizable columns** — all receive-table columns (including the
   Group address) can be dragged; widths persist across sessions.
 - **Pure standard library + PySide6** — no raw sockets, no admin rights
@@ -69,6 +71,7 @@ multicast/
     ├── stats.py                 # StatsTracker, format helpers
     ├── remote.py                # StatsExporter, RemoteSenderPoller
     ├── i18n.py                  # zh_CN / en translation strings
+    ├── theme.py                 # dark/light palettes + QSS design system
     └── ui.py                    # MainWindow, ReceiveTab, SendTab
 ```
 
@@ -257,6 +260,23 @@ python _i18n_test.py     # language switcher
 
 ## Tips
 
+- **FRR 真机验证**: FRR 10.x 上需在接口同时配置 `ip pim sm` **和**
+  `ip igmp`（vtysh）。只配 PIM 时 pimd 只创建一个 mtrace-only socket，
+  会**静默丢弃**所有成员报告，`show ip igmp groups` 恒为空 —— 用
+  `show ip igmp interface <if> json` 的 `mtraceOnly` 字段可确认。
+  IPv6 同理：`ipv6 pim sm` 之外还需 `ipv6 mld`。
+- **两台 FRR 的测试拓扑**（无需第二台机器）: 用 `ip netns` + veth 构造
+  第二台 FRR，`systemctl start frr@<pathspace>`（配置放
+  `/etc/frr/<pathspace>/`，含 `daemons` 文件）。坑：Ubuntu 的 AppArmor
+  会按守护进程限制 pathspace 子目录的 pid 文件写入（zebra 可以、
+  pimd/pim6d 被拒），需卸载对应 profile：
+  `echo -n pimd > /sys/kernel/security/apparmor/.remove`。
+  另外两平台的 IPv6 SSM socket API 只有**选项号**不同：Winsock 用
+  `MCAST_JOIN_SOURCE_GROUP (45) / MCAST_LEAVE_SOURCE_GROUP (46)`，
+  Linux 用 46 / 47；payload 布局两平台**一致**（RFC 3678
+  group_source_req：u32 ifindex 在前，后接 8 字节对齐的
+  group / source SOCKADDR_STORAGE——已对照 ws2ipdef.h 与 linux uapi in.h
+  核实；注意 IPv4 的 `ip_mreq_source` 才是两平台字段顺序真正不同的）。
 - **Loopback testing**: pick a group in `239.0.0.0/8` (administratively
   scoped) and use TTL = 0 in the sender; this confines traffic to the
   host and is great for sanity-checking the tool.

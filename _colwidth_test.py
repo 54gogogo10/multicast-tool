@@ -96,9 +96,39 @@ def main() -> int:
     assert abs(got2 - expected2) <= 2, f"after reset, Group={got2} expected ~{expected2}"
     print(f"OK: Reset re-enables auto-fill (Group -> {got2}px at viewport={vp2}px)")
 
-    s.clear()
+    # ---- 6. reset survives a restart (QSettings bool regression) -------
+    # The saved flag is stored as the string "true"/"false" on Windows;
+    # bool("false") is True in Python, which used to re-lock the auto-fill
+    # after every restart. Guard: flag must stay False, and auto-fill must
+    # still own the Group column, after save + close + reopen.
+    rt2.save_settings()
     s.sync()
     w2.close()
+    app.processEvents()
+
+    w3 = MainWindow()
+    w3.show()
+    app.processEvents()
+    rt3 = w3.recv_tab
+    hdr3 = rt3.table.horizontalHeader()
+    app.processEvents()
+    assert not rt3._group_user_resized, (
+        f"user_resized flag must stay False after reset+restart, got {rt3._group_user_resized!r}"
+    )
+    w3.resize(1400, 800)
+    app.processEvents()
+    vp3 = rt3.table.viewport().width()
+    others3 = sum(hdr3.sectionSize(i) for i in range(len(rt3.HEADER_KEYS)) if i != 1)
+    vh3 = rt3.table.verticalHeader()
+    vh3_w = vh3.width() if vh3 is not None and vh3.isVisible() else 0
+    expected3 = max(40, vp3 - others3 + vh3_w)
+    got3 = hdr3.sectionSize(1)
+    assert abs(got3 - expected3) <= 2, f"after restart, Group={got3} expected ~{expected3}"
+    print(f"OK: reset survives restart (auto-fill Group -> {got3}px at viewport={vp3}px)")
+
+    s.clear()
+    s.sync()
+    w3.close()
     app.processEvents()
     return 0
 

@@ -23,7 +23,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
 
@@ -49,9 +49,10 @@ def validate_host_port(host_port: str) -> tuple[str, int]:
 
     Only the most common forms are accepted: an alphanumeric / dotted /
     dash hostname or IPv4 literal, followed by ``:`` and a 1-5 digit port.
-    IPv6 literals must be supplied without brackets (we do not currently
-    support bracket notation in the UI). Reject anything that looks like
-    a URL, a file path, or an IPv6 address with a zone id.
+    IPv6 literals are rejected outright: the host part cannot contain a
+    colon (and an unbracketed ``v6:port`` would be ambiguous anyway), so
+    the remote monitor only supports IPv4 hosts / hostnames. Reject
+    anything that looks like a URL, a file path, or an IPv6 address.
 
     Loopback (127.0.0.0/8) and RFC1918 private addresses ARE allowed
     because the common use case is polling a sender on the same host
@@ -258,7 +259,6 @@ class RemoteSenderPoller:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._connecting = False
 
     @property
     def url(self) -> str:

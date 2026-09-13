@@ -1,4 +1,4 @@
-"""PySide6 main window for the multicast test tool.
+"""PySide main window for the multicast test tool.
 
 Two tabs:
 
@@ -10,7 +10,10 @@ Two tabs:
   a tiny HTTP server so another instance can display them.
 
 All user-facing strings are routed through :mod:`multicast_tool.i18n`
-so the UI can be flipped between Chinese and English at runtime.
+so the UI can be flipped between Chinese and English at runtime. The
+visual design (palettes, QSS, fonts) lives in
+:mod:`multicast_tool.theme`; dynamic rate colors must go through
+``theme.rate_color`` so they follow the active theme.
 """
 
 from __future__ import annotations
@@ -22,19 +25,17 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # Qt binding shim: PySide6 (default, Windows 10+) or PySide2 (Win7 build).
-from .qt_compat import (  # noqa: F401
-    QtCore, QtGui, QtWidgets,
-    Qt, QCoreApplication, QTimer, QByteArray, QEvent, QSettings, Signal, QObject,
-    QAction, QColor, QFont, QKeySequence,
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
-    QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+from .qt_compat import (
+    Qt, QTimer, QByteArray, QEvent, QSettings, Signal, QObject,
+    QApplication, QAction, QKeySequence, QPalette,
+    QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
+    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QSpinBox, QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget,
+    QSpinBox, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget,
     QVBoxLayout, QWidget,
-    PYSIDE_VERSION,
 )
 
-from . import i18n
+from . import i18n, theme
 from .core import (
     AddressFamily,
     IgmpVersion,
@@ -83,7 +84,6 @@ class ReceiverRow:
     receiver: MulticastReceiver
     stats: StatsTracker
     config: ReceiverConfig
-    started_at: float
 
 
 @dataclass
@@ -91,7 +91,6 @@ class AppState:
     receivers: dict[int, ReceiverRow] = field(default_factory=dict)
     next_row_id: int = 1
     sender: Optional[MulticastSender] = None
-    sender_stats: Optional[StatsTracker] = None
     # Remote-monitor (sender -> HTTP -> this receiver's UI)
     remote_poller: Optional[RemoteSenderPoller] = None
     # Stats-exporter (this sender side)
@@ -103,14 +102,23 @@ class AppState:
 # --------------------------------------------------------------------------- #
 
 
-def _color_for_pps(pps: float) -> QColor:
-    if pps <= 0.5:
-        return QColor("#888888")
-    if pps < 50:
-        return QColor("#1f8a3a")
-    if pps < 1000:
-        return QColor("#cf8a00")
-    return QColor("#c0392b")
+def _color_for_pps(pps: float):
+    """Rate color for the active theme (grey / green / amber / red)."""
+    return theme.rate_color(pps)
+
+
+def _set_label_color(lbl: QLabel, color) -> None:
+    """Dynamic text color for a QLabel.
+
+    ``QLabel.setForeground`` does not exist on PySide6, so the color is
+    set through the palette (WindowText role is what QLabel paints with;
+    Text is set too for safety). Refresh loops call this every tick, so
+    stale colors after a theme switch self-correct.
+    """
+    pal = lbl.palette()
+    pal.setColor(QPalette.WindowText, color)
+    pal.setColor(QPalette.Text, color)
+    lbl.setPalette(pal)
 
 
 def _format_elapsed(sec: float) -> str:
@@ -129,6 +137,25 @@ def _fill_combo(combo: QComboBox, items: list[str], current: Optional[str] = Non
     if current is not None and current in items:
         combo.setCurrentText(current)
     combo.blockSignals(False)
+
+
+def _stat_tile(caption_key: str, min_h: int) -> tuple[QFrame, tuple[QLabel, QLabel]]:
+    """Build one dashboard stat tile: caption on top, big value below."""
+    frame = QFrame()
+    frame.setObjectName("statTile")
+    frame.setMinimumHeight(min_h)
+    lay = QVBoxLayout(frame)
+    lay.setContentsMargins(14, 10, 14, 10)
+    lay.setSpacing(2)
+    cap = QLabel()
+    cap.setObjectName("statCaption")
+    cap.setText(i18n.t(caption_key))
+    val = QLabel("--")
+    val.setObjectName("statValue")
+    lay.addWidget(cap)
+    lay.addWidget(val)
+    lay.addStretch(1)
+    return frame, (cap, val)
 
 
 # --------------------------------------------------------------------------- #
@@ -153,6 +180,8 @@ class ReceiveTab(QWidget):
         self.bus = bus
         # Cached widget refs that need to be re-translated
         self._widgets: dict[str, QWidget] = {}
+        # Stat tiles: key -> (caption label, value label)
+        self._tiles: dict[str, tuple[QLabel, QLabel]] = {}
         self._build_ui()
         self._wire()
 
@@ -160,12 +189,49 @@ class ReceiveTab(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(12)
 
-        # Add form ----------------------------------------------------------
-        add_box = QGroupBox()
-        self._widgets["recv.add_group"] = add_box
-        form = QFormLayout(add_box)
+        # Top row: add-group form card + remote monitor card
+        top = QHBoxLayout()
+        top.setSpacing(12)
+        self._build_add_panel(top)
+        self._build_remote_panel(top)
+        root.addLayout(top)
+
+        # Dashboard stat tiles
+        root.addLayout(self._build_stat_tiles())
+
+        # Active memberships table + log in a vertical splitter
+        self._build_table_panel()
+        self._build_log_panel()
+        splitter = QSplitter(Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
+        splitter.addWidget(self._table_card)
+        splitter.addWidget(self._log_card)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([420, 160])
+        root.addWidget(splitter, 1)
+
+        # Initial population
+        self._populate_interfaces(AddressFamily.IPV4)
+        self.retranslate_ui()
+        # After language strings are loaded, do a final header refresh
+        self._set_table_headers()
+        QTimer.singleShot(0, self._refill_group_column)
+
+    def _label_for(self, form: QFormLayout, buddy: QWidget) -> QLabel:
+        lbl = QLabel()
+        lbl.setBuddy(buddy)
+        return lbl
+
+    def _build_add_panel(self, layout) -> None:
+        box = QGroupBox()
+        self._widgets["recv.add_group"] = box
+        form = QFormLayout(box)
+        form.setSpacing(8)
 
         self.family_combo = QComboBox()
         self.iface_combo = QComboBox()
@@ -175,6 +241,7 @@ class ReceiveTab(QWidget):
         self.port_edit = QSpinBox(); self.port_edit.setRange(1, 65535); self.port_edit.setValue(5000)
         self.sources_edit = QLineEdit()
         self.add_btn = QPushButton()
+        self.add_btn.setObjectName("primary")
         self.add_btn.setDefault(True)
 
         self._widgets["recv.add_family"] = self._label_for(form, self.family_combo)
@@ -191,34 +258,14 @@ class ReceiveTab(QWidget):
         form.addRow(self._widgets["recv.add_iface"], self.iface_combo)
         form.addRow(self._widgets["recv.add_version"], self.version_combo)
         form.addRow(self._widgets["recv.add_sources"], self.sources_edit)
-        form.addRow(self._widgets["recv.add_btn"], self.add_btn)
-        root.addWidget(add_box)
+        form.addRow("", self.add_btn)
+        layout.addWidget(box, 3)
 
-        # Remote sender monitor (NEW) --------------------------------------
-        self._build_remote_panel(root)
-
-        # Active memberships table -----------------------------------------
-        self._build_table_panel(root)
-
-        # Log ----------------------------------------------------------------
-        self._build_log_panel(root)
-
-        # Initial population
-        self._populate_interfaces(AddressFamily.IPV4)
-        self.retranslate_ui()
-        # After language strings are loaded, do a final header refresh
-        self._set_table_headers()
-        QTimer.singleShot(0, self._refill_group_column)
-
-    def _label_for(self, form: QFormLayout, buddy: QWidget) -> QLabel:
-        lbl = QLabel()
-        lbl.setBuddy(buddy)
-        return lbl
-
-    def _build_remote_panel(self, root: QVBoxLayout) -> None:
+    def _build_remote_panel(self, layout) -> None:
         box = QGroupBox()
         self._widgets["recv.remote_monitor"] = box
         outer = QVBoxLayout(box)
+        outer.setSpacing(8)
 
         # Address + interval row
         top = QHBoxLayout()
@@ -259,8 +306,6 @@ class ReceiveTab(QWidget):
         grid = QGridLayout()
         grid.setHorizontalSpacing(16)
         grid.setVerticalSpacing(4)
-        # Left column: target / mode / elapsed
-        # Right column: sent / bytes / rates
         self.remote_target_label = QLabel()
         self.remote_target_value = QLabel("--")
         self.remote_mode_label = QLabel()
@@ -275,31 +320,9 @@ class ReceiveTab(QWidget):
         self.remote_pps_value = QLabel("--")
         self.remote_bps_label = QLabel()
         self.remote_bps_value = QLabel("--")
-        self.remote_pps_value.setStyleSheet("font-weight: bold;")
-        self.remote_bps_value.setStyleSheet("font-weight: bold;")
+        self.remote_pps_value.setObjectName("strong")
+        self.remote_bps_value.setObjectName("strong")
 
-        grid.addWidget(self.remote_target_label, 0, 0)
-        grid.addWidget(self.remote_target_value, 0, 1)
-        grid.addWidget(self.remote_mode_label, 0, 2)
-        grid.addWidget(self.remote_mode_value, 0, 3)
-        grid.addWidget(self.remote_elapsed_label, 0, 4)
-        grid.addWidget(self.remote_elapsed_value, 0, 5)
-        grid.addWidget(self.remote_sent_label, 1, 0)
-        grid.addWidget(self.remote_sent_value, 1, 1)
-        grid.addWidget(self.remote_bytes_label, 1, 2)
-        grid.addWidget(self.remote_bytes_value, 1, 3)
-        grid.addWidget(self.remote_pps_label, 1, 4)
-        grid.addWidget(self.remote_pps_value, 1, 5)
-        grid.addWidget(self.remote_bps_label, 1, 5 + 0)  # span handled below
-        # Simpler: put bps on row 2
-        grid.removeWidget(self.remote_bps_label)
-        grid.removeWidget(self.remote_bps_value)
-        grid.addWidget(self.remote_pps_label, 1, 4)
-        grid.addWidget(self.remote_pps_value, 1, 5)
-        grid.addWidget(self.remote_bps_label, 2, 4)
-        grid.addWidget(self.remote_bps_value, 2, 5)
-        grid.addWidget(self.remote_bps_label, 1, 4)
-        # Actually simpler: just place them sequentially
         labels_values = [
             (self.remote_target_label, self.remote_target_value),
             (self.remote_mode_label,   self.remote_mode_value),
@@ -309,14 +332,12 @@ class ReceiveTab(QWidget):
             (self.remote_pps_label,     self.remote_pps_value),
             (self.remote_bps_label,     self.remote_bps_value),
         ]
-        # Reset the grid and place cleanly
-        for i in reversed(range(grid.count())):
-            item = grid.takeAt(i)
         for i, (lbl, val) in enumerate(labels_values):
             r, c = divmod(i, 4)
             grid.addWidget(lbl, r, c * 2)
             grid.addWidget(val, r, c * 2 + 1)
         outer.addLayout(grid)
+        outer.addStretch(1)
 
         # Cache labels for retranslation
         self._widgets["recv.remote_address"] = self.remote_addr_label
@@ -332,23 +353,38 @@ class ReceiveTab(QWidget):
         self._widgets["recv.remote_pps"] = self.remote_pps_label
         self._widgets["recv.remote_bps"] = self.remote_bps_label
 
-        root.addWidget(box)
+        layout.addWidget(box, 2)
 
-    def _build_table_panel(self, root: QVBoxLayout) -> None:
+    def _build_stat_tiles(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        for key in ("recv.tile.groups", "recv.tile.packets",
+                    "recv.tile.bytes", "recv.tile.rate"):
+            frame, pair = _stat_tile(key, 74)
+            row.addWidget(frame, 1)
+            self._tiles[key] = pair
+        return row
+
+    def _build_table_panel(self) -> None:
         box = QGroupBox()
+        self._table_card = box
         self._widgets["recv.active"] = box
         tlay = QVBoxLayout(box)
+        tlay.setSpacing(8)
         self.table = QTableWidget(0, len(self.HEADER_KEYS))
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
         hdr = self.table.horizontalHeader()
         for i in range(len(self.HEADER_KEYS)):
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
         for col, w in enumerate([40, 200, 60, 120, 80, 120, 90, 100, 90, 110, 80]):
             self.table.setColumnWidth(col, w)
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.setMinimumHeight(140)
         self._group_user_resized = False
         self._suppress_resize_signal = False
         hdr.sectionResized.connect(self._on_section_resized)
@@ -363,6 +399,7 @@ class ReceiveTab(QWidget):
         self.clear_btn = QPushButton()
         self.reset_cols_btn = QPushButton()
         self.stop_all_btn = QPushButton()
+        self.stop_all_btn.setObjectName("danger")
         self._widgets["recv.btn_remove"] = self.remove_btn
         self._widgets["recv.btn_reset_counters"] = self.clear_btn
         self._widgets["recv.btn_reset_columns"] = self.reset_cols_btn
@@ -373,18 +410,18 @@ class ReceiveTab(QWidget):
         bar.addStretch(1)
         bar.addWidget(self.stop_all_btn)
         tlay.addLayout(bar)
-        root.addWidget(box, 1)
 
-    def _build_log_panel(self, root: QVBoxLayout) -> None:
+    def _build_log_panel(self) -> None:
         box = QGroupBox()
+        self._log_card = box
         self._widgets["recv.log"] = box
         llay = QVBoxLayout(box)
         self.log = QPlainTextEdit()
+        self.log.setObjectName("logEdit")
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(2000)
-        self.log.setFont(QFont("Consolas", 9))
+        self.log.setMinimumHeight(80)
         llay.addWidget(self.log)
-        root.addWidget(box, 1)
 
     def _wire(self) -> None:
         self.add_btn.clicked.connect(self._on_add_clicked)
@@ -408,6 +445,8 @@ class ReceiveTab(QWidget):
                 w.setText(text)
             else:
                 w.setText(text)
+        for key, (cap, _val) in self._tiles.items():
+            cap.setText(i18n.t(key))
         # Family / version / interface defaults are also language-aware
         family = self._current_family()
         ver_items = (
@@ -425,7 +464,6 @@ class ReceiveTab(QWidget):
         fam_items = [i18n.t(f"family.{f.value.lower()}") for f in AddressFamily]
         # If the current selection was "IPv4" (English) and we switch to
         # Chinese, it becomes "IPv4" still; map by enum.
-        cur = self.family_combo.currentText()
         fam_cur = i18n.t(f"family.{family.value.lower()}")
         _fill_combo(self.family_combo, fam_items, fam_cur)
         # Re-populate interface combo to translate the "(default)" entry
@@ -499,9 +537,7 @@ class ReceiveTab(QWidget):
         if not is_multicast_group(group, family):
             QMessageBox.warning(
                 self, i18n.t("dlg.invalid_group"),
-                f"{group!r} \u4e0d\u662f\u6709\u6548\u7684 {family.value} \u7ec4\u64ad\u5730\u5740\u3002"
-                if i18n.get_language() == "zh_CN" else
-                f"{group!r} is not a valid {family.value} multicast address."
+                i18n.t("dlg.not_multicast").format(group=repr(group), family=family.value)
             )
             return
 
@@ -520,21 +556,26 @@ class ReceiveTab(QWidget):
         self.state.next_row_id += 1
         stats = StatsTracker()
         rcv = MulticastReceiver(cfg, stats)
+        # Wire the event bridge *before* start() so the STARTED event (and
+        # any early packets) are not lost to the race window.
+        rcv.on_event = lambda ev, rid=row_id: self.bus.receiver_event.emit(rid, ev)
         self._append_log(
             f"{i18n.t('recv.add_group')}: {family.value} {group}:{port} "
             f"v{version_obj.value} iface={iface or i18n.t('iface.default')}"
         )
+        row = ReceiverRow(
+            row_id=row_id, receiver=rcv, stats=stats, config=cfg,
+        )
+        # Register the row *before* start(): start() emits STARTED
+        # synchronously on this thread and the handler looks the row up
+        # in state.receivers, so a late registration drops the log line.
+        self.state.receivers[row_id] = row
         try:
             rcv.start()
         except Exception as e:  # noqa: BLE001
+            self.state.receivers.pop(row_id, None)
             QMessageBox.critical(self, i18n.t("dlg.failed_start"), f"{e}\n{traceback.format_exc()}")
             return
-        row = ReceiverRow(
-            row_id=row_id, receiver=rcv, stats=stats, config=cfg,
-            started_at=time.monotonic(),
-        )
-        self.state.receivers[row_id] = row
-        rcv.on_event = lambda ev, rid=row_id: self.bus.receiver_event.emit(rid, ev)
         self._insert_table_row(row)
 
     def _on_remove_clicked(self) -> None:
@@ -582,9 +623,12 @@ class ReceiveTab(QWidget):
         hdr = self.table.horizontalHeader()
         for i in range(len(self.HEADER_KEYS)):
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
-        self._group_user_resized = bool(
+        # NB: QSettings stores bools as the strings "true"/"false" on some
+        # backends (e.g. the Windows registry), and bool("false") is True in
+        # Python, so parse the flag from its string form explicitly.
+        self._group_user_resized = str(
             self._settings.value("receive_group_user_resized", False)
-        )
+        ).lower() in ("true", "1")
         if hdr.sectionSize(1) < 40:
             self._group_user_resized = False
 
@@ -656,19 +700,22 @@ class ReceiveTab(QWidget):
         self.log.appendPlainText(line.rstrip())
 
     def _stop_row(self, row_id: int) -> None:
-        row = self.state.receivers.pop(row_id, None)
+        row = self.state.receivers.get(row_id)
         if row is None:
             return
+        # stop() emits STOPPED synchronously while the row is still
+        # registered, so the log line is not dropped.
         try:
             row.receiver.stop()
         except Exception:  # noqa: BLE001
             logger.exception("Failed to stop receiver")
+        finally:
+            self.state.receivers.pop(row_id, None)
         for r in range(self.table.rowCount()):
             if self.table.item(r, 0) and int(self.table.item(r, 0).text()) == row_id:
                 self.table.removeRow(r)
                 break
-        self._append_log(f"row #{row_id} \u79fb\u9664" if i18n.get_language() == "zh_CN"
-                         else f"row #{row_id} removed")
+        self._append_log(i18n.t("recv.log_row_removed").format(row_id=row_id))
 
     def _on_receiver_event(self, row_id: int, event: ReceiverEvent) -> None:
         row = self.state.receivers.get(row_id)
@@ -688,9 +735,7 @@ class ReceiveTab(QWidget):
         addr = self.remote_addr_edit.text().strip()
         if not addr:
             QMessageBox.warning(self, i18n.t("dlg.invalid_input"),
-                                "\u8bf7\u8f93\u5165\u53d1\u9001\u7aef\u5730\u5740\uff08host:port\uff09"
-                                if i18n.get_language() == "zh_CN" else
-                                "Please enter sender address (host:port)")
+                                i18n.t("dlg.remote_addr_required"))
             return
         interval = float(self.remote_interval.value())
         if self.state.remote_poller is not None:
@@ -730,8 +775,7 @@ class ReceiveTab(QWidget):
                     self.remote_sent_value, self.remote_bytes_value,
                     self.remote_pps_value, self.remote_bps_value):
             lbl.setText("--")
-        self._append_log("remote sender: \u65ad\u5f00" if i18n.get_language() == "zh_CN"
-                         else "remote sender: disconnected")
+        self._append_log(i18n.t("recv.log_remote_disconnected"))
 
     def refresh_remote(self) -> None:
         poller = self.state.remote_poller
@@ -762,13 +806,17 @@ class ReceiveTab(QWidget):
         self.remote_pps_value.setText(f"{snap.pps:,.1f} pps")
         self.remote_bps_value.setText(format_rate_bps(snap.bps))
         # Colour-code the rates the same way as the table
-        self.remote_pps_value.setForeground(_color_for_pps(snap.pps))
-        self.remote_bps_value.setForeground(_color_for_pps(snap.pps))
+        _set_label_color(self.remote_pps_value, _color_for_pps(snap.pps))
+        _set_label_color(self.remote_bps_value, _color_for_pps(snap.pps))
 
     # -- periodic refresh -------------------------------------------------- #
 
     def refresh_stats(self) -> None:
         self.refresh_remote()
+        groups = len(self.state.receivers)
+        tot_packets = 0
+        tot_bytes = 0
+        tot_pps = 0.0
         for r in range(self.table.rowCount()):
             row_id_item = self.table.item(r, 0)
             if row_id_item is None:
@@ -790,6 +838,18 @@ class ReceiveTab(QWidget):
             bps_item.setText(format_rate_bps(snap.bps))
             bps_item.setForeground(_color_for_pps(snap.pps))
             self.table.item(r, 10).setText(_format_elapsed(snap.elapsed_sec))
+            tot_packets += snap.total_packets
+            tot_bytes += snap.total_bytes
+            tot_pps += snap.pps
+        self._update_tiles(groups, tot_packets, tot_bytes, tot_pps)
+
+    def _update_tiles(self, groups: int, packets: int, total_bytes: int, total_pps: float) -> None:
+        self._tiles["recv.tile.groups"][1].setText(str(groups))
+        self._tiles["recv.tile.packets"][1].setText(f"{packets:,}")
+        self._tiles["recv.tile.bytes"][1].setText(format_bytes(total_bytes))
+        rate_val = self._tiles["recv.tile.rate"][1]
+        rate_val.setText(f"{total_pps:,.1f}")
+        _set_label_color(rate_val, _color_for_pps(total_pps))
 
 
 # --------------------------------------------------------------------------- #
@@ -801,23 +861,38 @@ class SendTab(QWidget):
     """Send IPv4 / IPv6 multicast traffic, optionally exposing live stats
     over HTTP for a remote receiver to mirror."""
 
+    TILE_KEYS = ("send.tile.sent", "send.tile.bytes",
+                 "send.tile.rate", "send.tile.elapsed")
+
     def __init__(self, state: AppState, bus: _SignalBus, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.state = state
         self.bus = bus
         self._widgets: dict[str, QWidget] = {}
+        self._tiles: dict[str, tuple[QLabel, QLabel]] = {}
         self._build_ui()
         self._wire()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(12)
 
-        # Send parameters ----------------------------------------------------
-        self._build_params_box(root)
+        # Top row: send parameters card | stat tiles + stats exporter card
+        top = QHBoxLayout()
+        top.setSpacing(12)
+        self._build_params_box(top)
 
-        # Stats exporter (NEW) ---------------------------------------------
-        self._build_exporter_box(root)
+        right = QWidget()
+        right.setObjectName("panel")
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(12)
+        right_lay.addLayout(self._build_stat_tiles())
+        self._build_exporter_box(right_lay)
+        right_lay.addStretch(1)
+        top.addWidget(right, 2)
+        root.addLayout(top)
 
         # Send log ----------------------------------------------------------
         self._build_log_box(root)
@@ -826,10 +901,11 @@ class SendTab(QWidget):
         self.retranslate_ui()
         QTimer.singleShot(0, self._refresh_exporter_endpoint_hint)
 
-    def _build_params_box(self, root: QVBoxLayout) -> None:
+    def _build_params_box(self, layout) -> None:
         box = QGroupBox()
         self._widgets["send.params"] = box
-        form = QFormLayout(box)
+        outer = QVBoxLayout(box)
+        outer.setSpacing(8)
 
         self.s_family = QComboBox()
         self.s_group = QLineEdit("239.1.1.1")
@@ -847,67 +923,101 @@ class SendTab(QWidget):
         self.s_template_text.setEnabled(False)
         self.s_template.toggled.connect(self.s_template_text.setEnabled)
         self.s_start = QPushButton()
+        self.s_start.setObjectName("primary")
         self.s_stop = QPushButton()
+        self.s_stop.setObjectName("danger")
         self.s_stop.setEnabled(False)
         self.s_progress = QProgressBar(); self.s_progress.setRange(0, 100); self.s_progress.setValue(0)
+        self.s_progress.setTextVisible(False)
         self.s_status = QLabel()
 
         # Build the rate row as a composite (spinbox + "pps" unit) so the
         # unit label can be re-translated on language switch.
         self._rate_unit_label = QLabel(i18n.t("send.unit_pps"))
         self._rate_widget = QWidget()
+        self._rate_widget.setObjectName("panel")
         rate_lay = QHBoxLayout(self._rate_widget)
         rate_lay.setContentsMargins(0, 0, 0, 0)
         rate_lay.addWidget(self.s_rate)
         rate_lay.addWidget(self._rate_unit_label)
         rate_lay.addStretch(1)
 
-        # Each entry is (key, field-widget, label-buddy). The buddy is the
-        # widget the label points at via setBuddy (the spinbox / combobox
-        # for focus shortcut, the composite QWidget otherwise).
-        rows: list[tuple[str, QWidget, QWidget]] = [
+        # Two-column form: identity / interface on the left, traffic shape
+        # on the right. Each entry is (key, field-widget, label-buddy).
+        left_rows: list[tuple[str, QWidget, QWidget]] = [
             ("send.family", self.s_family, self.s_family),
             ("send.group", self.s_group, self.s_group),
             ("send.port", self.s_port, self.s_port),
             ("send.iface", self.s_iface, self.s_iface),
             ("send.source", self.s_source, self.s_source),
+        ]
+        right_rows: list[tuple[str, QWidget, QWidget]] = [
             ("send.ttl", self.s_ttl, self.s_ttl),
             ("send.payload", self.s_payload, self.s_payload),
             ("send.mode", self.s_mode, self.s_mode),
             ("send.count", self.s_count, self.s_count),
             ("send.rate", self._rate_widget, self.s_rate),
         ]
-        for key, field_widget, buddy in rows:
-            lbl = QLabel()
-            lbl.setBuddy(buddy)
-            form.addRow(lbl, field_widget)
-            self._widgets[key] = lbl
+        left_form = QFormLayout(); left_form.setSpacing(8)
+        right_form = QFormLayout(); right_form.setSpacing(8)
+        for rows, form in ((left_rows, left_form), (right_rows, right_form)):
+            for key, field_widget, buddy in rows:
+                lbl = QLabel()
+                lbl.setBuddy(buddy)
+                form.addRow(lbl, field_widget)
+                self._widgets[key] = lbl
+        cols = QHBoxLayout()
+        cols.setSpacing(16)
+        cols.addLayout(left_form, 1)
+        cols.addLayout(right_form, 1)
+        outer.addLayout(cols)
 
-        # Template row: checkbox on the left, text input on the right.
-        form.addRow(self.s_template, self.s_template_text)
-        self._widgets["send.template"] = self.s_template
+        # Template row spans both columns.
+        tpl_row = QHBoxLayout()
+        tpl_row.addWidget(self.s_template)
+        tpl_row.addWidget(self.s_template_text, 1)
+        outer.addLayout(tpl_row)
 
         # Control buttons
         ctl = QHBoxLayout()
         ctl.addWidget(self.s_start)
         ctl.addWidget(self.s_stop)
         ctl.addStretch(1)
-        ctl_w = QWidget(); ctl_w.setLayout(ctl)
-        form.addRow(ctl_w)
+        outer.addLayout(ctl)
         self._widgets["send.btn_start"] = self.s_start
         self._widgets["send.btn_stop"] = self.s_stop
 
         # Progress and status
         self._widgets["send.progress"] = QLabel()
-        form.addRow(self._widgets["send.progress"], self.s_progress)
-        self._widgets["send.status"] = QLabel()
-        form.addRow(self._widgets["send.status"], self.s_status)
-        root.addWidget(box)
+        prow = QHBoxLayout()
+        prow.addWidget(self._widgets["send.progress"])
+        prow.addWidget(self.s_progress, 1)
+        outer.addLayout(prow)
 
-    def _build_exporter_box(self, root: QVBoxLayout) -> None:
+        self._widgets["send.status"] = QLabel()
+        srow = QHBoxLayout()
+        srow.addWidget(self._widgets["send.status"])
+        srow.addWidget(self.s_status, 1)
+        srow.addStretch(1)
+        outer.addLayout(srow)
+
+        layout.addWidget(box, 3)
+
+    def _build_stat_tiles(self) -> QGridLayout:
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        for i, key in enumerate(self.TILE_KEYS):
+            frame, pair = _stat_tile(key, 64)
+            r, c = divmod(i, 2)
+            grid.addWidget(frame, r, c)
+            self._tiles[key] = pair
+        return grid
+
+    def _build_exporter_box(self, layout) -> None:
         box = QGroupBox()
         self._widgets["send.expose"] = box
         outer = QVBoxLayout(box)
+        outer.setSpacing(8)
         top = QHBoxLayout()
         self.exp_port_label = QLabel()
         self.exp_port = QSpinBox()
@@ -938,28 +1048,29 @@ class SendTab(QWidget):
         hint_row = QHBoxLayout()
         self.exp_endpoint_label = QLabel()
         self.exp_endpoint_value = QLabel("--")
+        self.exp_endpoint_value.setObjectName("hint")
         self.exp_endpoint_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.exp_endpoint_value.setStyleSheet("color: #666; font-family: Consolas, monospace;")
         hint_row.addWidget(self.exp_endpoint_label)
         hint_row.addWidget(self.exp_endpoint_value, 1)
         outer.addLayout(hint_row)
         self._widgets["send.expose_port"] = self.exp_port_label
         self._widgets["send.expose_start"] = self.exp_start
         self._widgets["send.expose_stop"] = self.exp_stop
-        self._widgets["send.expose_status_off_marker"] = self.exp_status_label
+        self._widgets["send.expose_status"] = self.exp_status_label
         self._widgets["send.expose_endpoint"] = self.exp_endpoint_label
-        root.addWidget(box)
+        layout.addWidget(box, 2)
 
-    def _build_log_box(self, root: QVBoxLayout) -> None:
+    def _build_log_box(self, layout) -> None:
         box = QGroupBox()
         self._widgets["send.log"] = box
         llay = QVBoxLayout(box)
         self.s_log = QPlainTextEdit()
+        self.s_log.setObjectName("logEdit")
         self.s_log.setReadOnly(True)
         self.s_log.setMaximumBlockCount(2000)
-        self.s_log.setFont(QFont("Consolas", 9))
+        self.s_log.setMinimumHeight(110)
         llay.addWidget(self.s_log)
-        root.addWidget(box, 1)
+        layout.addWidget(box, 1)
 
     def _wire(self) -> None:
         self.s_start.clicked.connect(self._on_start_clicked)
@@ -982,6 +1093,8 @@ class SendTab(QWidget):
                 w.setText(text)
             else:
                 w.setText(text)
+        for key in self.TILE_KEYS:
+            self._tiles[key][0].setText(i18n.t(key))
         # Family combo (use translated labels but keep enum value identifiable)
         family = self._current_family()
         fam_items = [i18n.t(f"family.{f.value.lower()}") for f in AddressFamily]
@@ -1076,9 +1189,7 @@ class SendTab(QWidget):
             return
         if not is_multicast_group(group, family):
             QMessageBox.warning(self, i18n.t("dlg.invalid_group"),
-                                f"{group!r} \u4e0d\u662f\u6709\u6548\u7684 {family.value} \u7ec4\u64ad\u5730\u5740"
-                                if i18n.get_language() == "zh_CN" else
-                                f"{group!r} is not a valid {family.value} multicast address.")
+                                i18n.t("dlg.not_multicast").format(group=repr(group), family=family.value))
             return
 
         cfg = SenderConfig(
@@ -1087,31 +1198,33 @@ class SendTab(QWidget):
             rate_pps=rate, payload_template=template,
         )
         sender = MulticastSender(cfg)
+        # Wire the event bridge *before* start() so the STARTED event is not
+        # lost to the race window.
+        sender.on_event = lambda ev: self.bus.sender_event.emit(ev)
         try:
             sender.start()
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, i18n.t("dlg.failed_start"), f"{e}\n{traceback.format_exc()}")
             return
-        sender.on_event = lambda ev: self.bus.sender_event.emit(ev)
         self.state.sender = sender
-        self.s_status.setText("Running")
+        self.s_status.setText(i18n.t("send.status_running"))
         self.s_start.setEnabled(False)
         self.s_stop.setEnabled(True)
         self.s_progress.setValue(0)
-        self._append_log(
-            f"start: {family.value} {group}:{port} mode={mode.value} ttl={ttl} payload={payload_size}"
-        )
+        self._append_log(i18n.t("send.log_started").format(
+            family=family.value, group=group, port=port, mode=mode.value,
+            ttl=ttl, payload=payload_size,
+        ))
         # If a stats exporter is running, rebuild its provider
         self._refresh_exporter_provider()
 
     def _on_stop_clicked(self) -> None:
         if self.state.sender is None:
             return
-        sent = self.state.sender._sent
+        sent = self.state.sender.sent_count()
         self.state.sender.stop()
-        self._append_log(f"stop: {sent} \u5305\u5df2\u53d1\u9001" if i18n.get_language() == "zh_CN"
-                         else f"stop: {sent} packets sent")
         self.state.sender = None
+        self._append_log(i18n.t("send.log_stopped").format(sent=sent))
         self.s_status.setText(i18n.t("send.status_idle"))
         self.s_start.setEnabled(True)
         self.s_stop.setEnabled(False)
@@ -1126,8 +1239,13 @@ class SendTab(QWidget):
             self.s_status.setText(i18n.t("send.status_idle"))
             self.s_start.setEnabled(True)
             self.s_stop.setEnabled(False)
-            if self.state.sender is not None and event.sent:
-                self.s_progress.setValue(100)
+            if self.state.sender is not None:
+                # Natural completion: drop the reference so the stats
+                # exporter reports 'idle' instead of a frozen 'running'.
+                if event.sent:
+                    self.s_progress.setValue(100)
+                self.state.sender = None
+                self._refresh_exporter_provider()
         elif event.type is SenderEventType.PROGRESS:
             if event.target > 0:
                 pct = int(event.sent * 100 / event.target)
@@ -1142,6 +1260,26 @@ class SendTab(QWidget):
 
     def _append_log(self, line: str) -> None:
         self.s_log.appendPlainText(line.rstrip())
+
+    # -- live send stats (tiles) ------------------------------------------ #
+
+    def refresh_stats(self) -> None:
+        """Update the send-tab stat tiles from the active sender, if any."""
+        sender = self.state.sender
+        if sender is not None and sender.is_running():
+            snap = sender.stats.snapshot()
+            values = (
+                f"{snap.total_packets:,}",
+                format_bytes(snap.total_bytes),
+                f"{snap.pps:,.1f}",
+                _format_elapsed(snap.elapsed_sec),
+            )
+            _set_label_color(self._tiles["send.tile.rate"][1], _color_for_pps(snap.pps))
+        else:
+            values = ("0", "0.00 B", "0.0", "--")
+            _set_label_color(self._tiles["send.tile.rate"][1], _color_for_pps(0.0))
+        for key, text in zip(self.TILE_KEYS, values):
+            self._tiles[key][1].setText(text)
 
     # -- stats exporter (sender side) ------------------------------------ #
 
@@ -1208,14 +1346,10 @@ class SendTab(QWidget):
 
     def _make_stats_provider(self):
         state = self.state
-        family_marker = lambda: (state.sender.config.family.value if state.sender else "")
-        target_count_for_mode = lambda s: (
-            0 if s.config.mode is SenderMode.CONTINUOUS else int(s.config.count)
-        )
 
         def provider() -> dict:
             sender = state.sender
-            if sender is None:
+            if sender is None or not sender.is_running():
                 return {
                     "status": "idle",
                     "sent": 0, "bytes": 0, "pps": 0.0, "bps": 0.0,
@@ -1224,6 +1358,8 @@ class SendTab(QWidget):
                     "target_family": "", "mode": "", "target_count": 0,
                 }
             snap = sender.stats.snapshot()
+            # Read everything through the local `sender`: the GUI thread may
+            # swap state.sender to None while this request is in flight.
             return {
                 "status": "running",
                 "sent": snap.total_packets,
@@ -1233,9 +1369,10 @@ class SendTab(QWidget):
                 "elapsed_sec": round(snap.elapsed_sec, 2),
                 "target_group": sender.config.group,
                 "target_port": sender.config.port,
-                "target_family": family_marker(),
+                "target_family": sender.config.family.value,
                 "mode": sender.config.mode.value,
-                "target_count": target_count_for_mode(sender),
+                "target_count": (0 if sender.config.mode is SenderMode.CONTINUOUS
+                                 else int(sender.config.count)),
             }
         return provider
 
@@ -1260,16 +1397,23 @@ class SendTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        # Style the app before any widget is realized (idempotent).
+        theme.ensure_applied(QApplication.instance())
         self.state = AppState()
         self.bus = _SignalBus()
         self._language_actions: dict[str, QAction] = {}
+        self._theme_actions: dict[str, QAction] = {}
 
         self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
         self.recv_tab = ReceiveTab(self.state, self.bus)
         self.send_tab = SendTab(self.state, self.bus)
         self.tabs.addTab(self.recv_tab, i18n.t("tab.receive"))
         self.tabs.addTab(self.send_tab, i18n.t("tab.send"))
         self.setCentralWidget(self.tabs)
+
+        self.resize(1200, 780)
+        self.setMinimumSize(1000, 660)
 
         # Status bar
         sb = QStatusBar()
@@ -1283,6 +1427,7 @@ class MainWindow(QMainWindow):
         self._refresh = QTimer(self)
         self._refresh.setInterval(500)
         self._refresh.timeout.connect(self.recv_tab.refresh_stats)
+        self._refresh.timeout.connect(self.send_tab.refresh_stats)
         self._refresh.start()
 
         # React to language changes
@@ -1298,7 +1443,7 @@ class MainWindow(QMainWindow):
         act_quit.setShortcut(QKeySequence.Quit)
         act_quit.triggered.connect(self.close)
         m_file.addAction(act_quit)
-        # View -> Language
+        # View -> Language / Theme
         m_view = mbar.addMenu(i18n.t("menu.view"))
         m_lang = m_view.addMenu(i18n.t("menu.language"))
         for code, name in i18n.LANGUAGES.items():
@@ -1308,6 +1453,14 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda _checked=False, c=code: self._switch_language(c))
             m_lang.addAction(act)
             self._language_actions[code] = act
+        m_theme = m_view.addMenu(i18n.t("menu.theme"))
+        for name in theme.THEMES:
+            act = QAction(i18n.t(f"theme.{name}"), self, checkable=True)
+            act.setData(name)
+            act.setChecked(theme.current_theme() == name)
+            act.triggered.connect(lambda _checked=False, n=name: self._switch_theme(n))
+            m_theme.addAction(act)
+            self._theme_actions[name] = act
         # Help
         m_help = mbar.addMenu(i18n.t("menu.help"))
         act_about = QAction(i18n.t("act.about"), self)
@@ -1323,6 +1476,17 @@ class MainWindow(QMainWindow):
         # Re-apply translations
         self.retranslate_ui()
 
+    def _switch_theme(self, name: str) -> None:
+        if name not in theme.THEMES:
+            return
+        if name != theme.current_theme():
+            app = QApplication.instance()
+            if app is not None:
+                theme.apply_app(app, name)
+            theme.save_theme(name)
+        for code, act in self._theme_actions.items():
+            act.setChecked(code == theme.current_theme())
+
     def _on_language_changed(self, _lang: str) -> None:
         # Called by the i18n module via add_listener. Re-translate UI.
         self.retranslate_ui()
@@ -1333,14 +1497,8 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(1, i18n.t("tab.send"))
         self.recv_tab.retranslate_ui()
         self.send_tab.retranslate_ui()
-        # Menus: rebuild the top-level entries that depend on language
-        # (text only; shortcut objects are recreated by re-adding actions)
-        for menu in self.menuBar().findChildren(type(self.menuBar().actions()[0].menu())):
-            pass  # Qt's QMenuBar rebuilds text via setTitle on each QMenu
-        mbar = self.menuBar()
-        for top in mbar.findChildren(type(mbar.actions()[0].menu())):
-            pass
         # The simplest robust approach: rebuild menus
+        mbar = self.menuBar()
         for action in list(mbar.actions()):
             mbar.removeAction(action)
         self._build_menus()

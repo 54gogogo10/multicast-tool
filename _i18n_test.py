@@ -17,6 +17,15 @@ from multicast_tool.ui import MainWindow
 
 
 def main() -> int:
+    # ---- 0. zh_CN / en key sets must be identical ----------------------
+    zh_keys = set(i18n.STRINGS["zh_CN"])
+    en_keys = set(i18n.STRINGS["en"])
+    assert zh_keys == en_keys, (
+        f"i18n key mismatch: zh-only={sorted(zh_keys - en_keys)} "
+        f"en-only={sorted(en_keys - zh_keys)}"
+    )
+    print(f"OK: {len(zh_keys)} i18n keys present in both zh_CN and en")
+
     QCoreApplication.setOrganizationName("multicast-tool")
     QCoreApplication.setApplicationName("Multicast Test Tool")
     s = QSettings("multicast-tool", "Multicast Test Tool")

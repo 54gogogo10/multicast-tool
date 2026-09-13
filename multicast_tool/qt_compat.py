@@ -17,37 +17,38 @@ from __future__ import annotations
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
     from PySide6.QtCore import Qt, QCoreApplication, QTimer, QByteArray, QEvent, QSettings, Signal, QObject
-    from PySide6.QtGui import QAction, QColor, QFont, QKeySequence
+    from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPalette
     from PySide6.QtWidgets import (
         QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
-        QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-        QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-        QPushButton, QSpinBox, QStatusBar, QTableWidget, QTableWidgetItem,
-        QTabWidget, QVBoxLayout, QWidget,
+        QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
+        QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
+        QProgressBar, QPushButton, QSpinBox, QSplitter, QStatusBar,
+        QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
     )
     PYSIDE_VERSION = 6
 except ImportError:  # PySide2 / Win7 build
     from PySide2 import QtCore, QtGui, QtWidgets  # noqa: F401
     from PySide2.QtCore import Qt, QCoreApplication, QTimer, QByteArray, QEvent, QSettings, Signal, QObject
-    from PySide2.QtGui import QColor, QFont, QKeySequence
+    from PySide2.QtGui import QColor, QFont, QKeySequence, QPalette
     from PySide2.QtWidgets import (
         QAbstractItemView, QAction, QApplication, QCheckBox, QComboBox,
-        QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
-        QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
-        QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QStatusBar,
-        QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+        QDoubleSpinBox, QFormLayout, QFrame, QGridLayout, QGroupBox,
+        QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+        QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QSplitter,
+        QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
+        QWidget,
     )
     PYSIDE_VERSION = 2
 
 __all__ = [
     "QtCore", "QtGui", "QtWidgets",
     "Qt", "QCoreApplication", "QTimer", "QByteArray", "QEvent", "QSettings", "Signal", "QObject",
-    "QAction", "QColor", "QFont", "QKeySequence",
+    "QAction", "QColor", "QFont", "QKeySequence", "QPalette",
     "QAbstractItemView", "QApplication", "QCheckBox", "QComboBox", "QDoubleSpinBox",
-    "QFormLayout", "QGridLayout", "QGroupBox", "QHBoxLayout", "QHeaderView",
+    "QFormLayout", "QFrame", "QGridLayout", "QGroupBox", "QHBoxLayout", "QHeaderView",
     "QLabel", "QLineEdit", "QMainWindow", "QMessageBox", "QPlainTextEdit",
-    "QProgressBar", "QPushButton", "QSpinBox", "QStatusBar", "QTableWidget",
-    "QTableWidgetItem", "QTabWidget", "QVBoxLayout", "QWidget",
+    "QProgressBar", "QPushButton", "QSpinBox", "QSplitter", "QStatusBar",
+    "QTableWidget", "QTableWidgetItem", "QTabWidget", "QVBoxLayout", "QWidget",
     "PYSIDE_VERSION", "exec_app",
 ]
 
