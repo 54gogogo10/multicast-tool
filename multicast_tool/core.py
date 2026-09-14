@@ -69,7 +69,13 @@ class MldVersion(str, enum.Enum):
 
 
 def is_multicast_group(group: str, family: AddressFamily) -> bool:
-    """Return True if ``group`` is a valid multicast address for the family."""
+    """Return True if ``group`` is a valid multicast address for the family.
+
+    Scoped IPv6 literals (``ff02::1%5``) are accepted as syntactically
+    multicast by Python 3.9+ but cannot be passed to ``inet_pton``;
+    callers that need a wire-usable address must also check
+    :func:`has_zone_id`.
+    """
     try:
         addr = ipaddress.ip_address(group)
     except ValueError:
@@ -79,6 +85,11 @@ def is_multicast_group(group: str, family: AddressFamily) -> bool:
     if family is AddressFamily.IPV6:
         return isinstance(addr, ipaddress.IPv6Address) and addr.is_multicast
     return False
+
+
+def has_zone_id(addr: str) -> bool:
+    """Return True if ``addr`` carries an IPv6 zone id (``%zone`` suffix)."""
+    return "%" in addr
 
 
 def parse_source_list(text: str, family: AddressFamily) -> list[str]:
@@ -92,6 +103,11 @@ def parse_source_list(text: str, family: AddressFamily) -> list[str]:
     tokens = [t.strip() for t in text.replace(",", " ").split() if t.strip()]
     out: list[str] = []
     for tok in tokens:
+        if has_zone_id(tok):
+            raise ValueError(
+                f"Invalid source IP {tok!r}: remove the %zone suffix and "
+                f"set the interface field instead"
+            )
         try:
             addr = ipaddress.ip_address(tok)
         except ValueError as e:
@@ -525,6 +541,11 @@ class MulticastReceiver:
             return
         if not is_multicast_group(self.config.group, self.config.family):
             raise ValueError(f"Not a valid {self.config.family.value} multicast address: {self.config.group!r}")
+        if has_zone_id(self.config.group):
+            raise ValueError(
+                f"Group address {self.config.group!r} has a %zone suffix; "
+                f"remove it and pick the interface in the interface field"
+            )
         if not (1 <= self.config.port <= 65535):
             raise ValueError(f"Port out of range: {self.config.port}")
         # Validate source list (will raise on bad input). Sources must also
@@ -596,6 +617,17 @@ class MulticastReceiver:
         family = _af(self.config.family)
         sock = socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         try:
+            self._configure_socket(sock)
+        except Exception:
+            # Never leak the fd when an option or the bind fails: the
+            # exception's traceback keeps the frame (and the socket)
+            # alive for as long as the UI holds the error dialog text.
+            sock.close()
+            raise
+        return sock
+
+    def _configure_socket(self, sock: socket.socket) -> None:
+        try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         except OSError:
             pass
@@ -626,7 +658,6 @@ class MulticastReceiver:
             else:
                 sock.bind(("0.0.0.0", self.config.port))
         sock.settimeout(0.5)  # allow periodic running-flag check
-        return sock
 
     def _join_group(self, sock: socket.socket) -> None:
         if self.config.family is AddressFamily.IPV4:
@@ -865,8 +896,15 @@ class MulticastSender:
             return
         if not is_multicast_group(self.config.group, self.config.family):
             raise ValueError(f"Not a valid {self.config.family.value} multicast address: {self.config.group!r}")
+        if has_zone_id(self.config.group):
+            raise ValueError(
+                f"Group address {self.config.group!r} has a %zone suffix; "
+                f"remove it and pick the interface in the interface field"
+            )
         if not (1 <= self.config.port <= 65535):
             raise ValueError(f"Port out of range: {self.config.port}")
+        if not (0 <= self.config.ttl <= 255):
+            raise ValueError(f"TTL / hop limit out of range: {self.config.ttl}")
         if self.config.payload_size < 0 or self.config.payload_size > 65507:
             raise ValueError(f"Payload size out of range: {self.config.payload_size}")
 
@@ -908,6 +946,14 @@ class MulticastSender:
     def _make_socket(self) -> socket.socket:
         family = _af(self.config.family)
         sock = socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        try:
+            self._configure_socket(sock)
+        except Exception:
+            sock.close()
+            raise
+        return sock
+
+    def _configure_socket(self, sock: socket.socket) -> None:
         if self.config.family is AddressFamily.IPV4:
             # Set outgoing interface (IP_MULTICAST_IF wants an address)
             if self.config.source:
@@ -938,7 +984,6 @@ class MulticastSender:
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, self.config.ttl)
         # Use a non-zero send buffer for higher throughput
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
-        return sock
 
     def _send_loop(self) -> None:
         assert self._sock is not None
@@ -946,6 +991,7 @@ class MulticastSender:
         target = (self.config.group, self.config.port)
         payload = self._build_payload()
         sent = 0
+        errored = False
         target_count: Optional[int]
         if self.config.mode is SenderMode.BURST:
             target_count = max(0, int(self.config.count))
@@ -973,7 +1019,12 @@ class MulticastSender:
                 try:
                     sock.sendto(payload, target)
                 except OSError as e:
+                    if self._stop_requested.is_set():
+                        # stop() closed the socket mid-sendto; that is a
+                        # normal shutdown, not a send failure.
+                        break
                     self._error = str(e)
+                    errored = True
                     self._emit(SenderEventType.ERROR, f"send error: {e}")
                     break
                 sent += 1
@@ -1001,11 +1052,21 @@ class MulticastSender:
                         # We're behind schedule; reset to avoid drift burst
                         next_send = time.monotonic()
         finally:
+            # The loop owns the socket once started: close it here so a
+            # natural completion (or a send error) does not rely on GC to
+            # release the fd. Closing twice (stop() may have closed it) is
+            # a no-op.
+            try:
+                sock.close()
+            except OSError:
+                pass
             self._emit(SenderEventType.PROGRESS, sent=sent, target=target_count or 0)
             if self._running.is_set():
-                # Reached target naturally
+                # Reached target (or aborted on an error) without stop()
                 self._running.clear()
-                self._emit(SenderEventType.STOPPED, f"Done ({sent} sent)")
+                msg = (f"Stopped after error ({sent} sent)" if errored
+                       else f"Done ({sent} sent)")
+                self._emit(SenderEventType.STOPPED, msg)
 
     def _build_payload(self) -> bytes:
         if self.config.payload_template:

@@ -92,12 +92,21 @@ def validate_host_port(host_port: str) -> tuple[str, int]:
 
 
 class _StatsHTTPHandler(BaseHTTPRequestHandler):
-    """HTTP handler bound to a :class:`StatsExporter` at startup."""
+    """HTTP handler for :class:`StatsExporter`.
 
-    # Class-level binding: BaseHTTPRequestHandler is instantiated by
-    # HTTPServer for every request, so we set the provider on the class
-    # rather than on each instance.
+    ``StatsExporter.start`` builds a per-instance subclass with the
+    ``provider`` attribute bound, so two exporters in the same process
+    never serve each other's stats.
+    """
+
     provider: Optional[StatsProvider] = None
+    # Drop connections that connect but never send a request: without a
+    # timeout, one thread per idle connection piles up when the server
+    # is bound to 0.0.0.0 on a hostile LAN.
+    timeout = 5
+
+    def version_string(self) -> str:  # hide the Python version header
+        return "mc-stats"
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path.split("?", 1)[0] != "/stats":
@@ -106,7 +115,7 @@ class _StatsHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"not found")
             return
-        provider = _StatsHTTPHandler.provider
+        provider = type(self).provider
         if provider is None:
             payload = {"status": "no-provider"}
         else:
@@ -173,9 +182,13 @@ class StatsExporter:
             return
         if not (1 <= self.port <= 65535):
             raise ValueError(f"Port out of range: {self.port}")
-        _StatsHTTPHandler.provider = self._stats_provider
+        handler_cls = type(
+            "BoundStatsHTTPHandler",
+            (_StatsHTTPHandler,),
+            {"provider": self._stats_provider},
+        )
         try:
-            server = ThreadingHTTPServer((self.bind, self.port), _StatsHTTPHandler)
+            server = ThreadingHTTPServer((self.bind, self.port), handler_cls)
         except OSError as e:
             self._error = f"Cannot bind {self.bind}:{self.port}: {e}"
             raise
@@ -200,8 +213,6 @@ class StatsExporter:
         if thread is not None:
             thread.join(timeout=2.0)
         self._bound_port = None
-        if _StatsHTTPHandler.provider is self._stats_provider:
-            _StatsHTTPHandler.provider = None
 
 
 # --------------------------------------------------------------------------- #
@@ -302,16 +313,35 @@ class RemoteSenderPoller:
                     data = json.loads(raw)
                 with self._lock:
                     self._snapshot = _to_snapshot(data)
-            except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as e:
+            except (urllib.error.URLError, urllib.error.HTTPError,
+                    OSError, ValueError) as e:
                 with self._lock:
                     self._snapshot = RemoteSenderSnapshot(
                         status="error", error=str(e)
+                    )
+            except Exception as e:  # noqa: BLE001
+                # Anything unexpected (weird JSON shapes, attribute errors
+                # on hostile payloads, ...) must not kill the poll thread:
+                # a dead poller leaves the UI stuck on "connecting".
+                with self._lock:
+                    self._snapshot = RemoteSenderSnapshot(
+                        status="error", error=f"bad response: {e!r}"
                     )
             self._stop.wait(self.interval_sec)
 
 
 def _to_snapshot(d: dict) -> RemoteSenderSnapshot:
-    """Coerce a JSON-decoded dict into a :class:`RemoteSenderSnapshot`."""
+    """Coerce a JSON-decoded dict into a :class:`RemoteSenderSnapshot`.
+
+    A non-dict JSON body (list, string, number, ...) maps to an error
+    snapshot instead of raising -- the sender's /stats endpoint always
+    answers with an object.
+    """
+    if not isinstance(d, dict):
+        return RemoteSenderSnapshot(
+            status="error",
+            error=f"unexpected response type: {type(d).__name__}",
+        )
     try:
         sent_packets = int(d.get("sent", d.get("sent_packets", 0)) or 0)
     except (TypeError, ValueError):

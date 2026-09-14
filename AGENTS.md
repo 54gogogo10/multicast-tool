@@ -37,6 +37,9 @@ python _remote_test.py     # sender-rate sync end-to-end (HTTP /stats)
 python _i18n_test.py       # language switcher
 python _sender_done_test.py  # sender tab state after a send finishes
 python _security_test.py   # remote.py host:port validation
+python _audit_round3_test.py  # audit fixes: zone-id/TTL validation, stop
+                              # race, socket close, poller resilience,
+                              # exporter isolation, Server header
 ```
 
 Builds (Windows): `build.bat` (PySide6 onedir), `build.bat onefile`,

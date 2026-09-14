@@ -1242,7 +1242,7 @@ class SendTab(QWidget):
             if self.state.sender is not None:
                 # Natural completion: drop the reference so the stats
                 # exporter reports 'idle' instead of a frozen 'running'.
-                if event.sent:
+                if event.sent and self.state.sender.last_error is None:
                     self.s_progress.setValue(100)
                 self.state.sender = None
                 self._refresh_exporter_provider()
