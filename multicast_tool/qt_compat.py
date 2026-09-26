@@ -20,10 +20,11 @@ try:
     from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPalette
     from PySide6.QtWidgets import (
         QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
-        QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
-        QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-        QProgressBar, QPushButton, QSpinBox, QSplitter, QStatusBar,
-        QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+        QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
+        QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+        QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QSplitter,
+        QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
+        QWidget,
     )
     PYSIDE_VERSION = 6
 except ImportError:  # PySide2 / Win7 build
@@ -32,11 +33,11 @@ except ImportError:  # PySide2 / Win7 build
     from PySide2.QtGui import QColor, QFont, QKeySequence, QPalette
     from PySide2.QtWidgets import (
         QAbstractItemView, QAction, QApplication, QCheckBox, QComboBox,
-        QDoubleSpinBox, QFormLayout, QFrame, QGridLayout, QGroupBox,
-        QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
-        QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QSplitter,
-        QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
-        QWidget,
+        QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout,
+        QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
+        QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox,
+        QSplitter, QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget,
+        QVBoxLayout, QWidget,
     )
     PYSIDE_VERSION = 2
 
@@ -45,7 +46,7 @@ __all__ = [
     "Qt", "QCoreApplication", "QTimer", "QByteArray", "QEvent", "QSettings", "Signal", "QObject",
     "QAction", "QColor", "QFont", "QKeySequence", "QPalette",
     "QAbstractItemView", "QApplication", "QCheckBox", "QComboBox", "QDoubleSpinBox",
-    "QFormLayout", "QFrame", "QGridLayout", "QGroupBox", "QHBoxLayout", "QHeaderView",
+    "QFileDialog", "QFormLayout", "QFrame", "QGridLayout", "QGroupBox", "QHBoxLayout", "QHeaderView",
     "QLabel", "QLineEdit", "QMainWindow", "QMessageBox", "QPlainTextEdit",
     "QProgressBar", "QPushButton", "QSpinBox", "QSplitter", "QStatusBar",
     "QTableWidget", "QTableWidgetItem", "QTabWidget", "QVBoxLayout", "QWidget",

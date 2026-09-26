@@ -327,6 +327,12 @@ def rate_color(pps: float) -> QColor:
     return QColor(p["rate_high"])
 
 
+def loss_color(lost: int) -> QColor:
+    """Dim grey for a clean stream, red as soon as packets go missing."""
+    p = PALETTES[current_theme()]
+    return QColor(p["rate_high"] if lost > 0 else p["rate_dim"])
+
+
 def _font() -> QFont:
     if sys.platform.startswith("win"):
         return QFont("Segoe UI", 9)

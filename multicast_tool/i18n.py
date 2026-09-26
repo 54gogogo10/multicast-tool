@@ -54,6 +54,10 @@ STRINGS: dict[str, dict[str, str]] = {
         "recv.btn_stop_all": "全部停止",
         "recv.btn_reset_counters": "重置计数 (选中)",
         "recv.btn_reset_columns": "重置列宽",
+        "recv.btn_export_csv": "导出 CSV",
+        "recv.csv_written": "已导出 {rows} 行到 {path}",
+        "recv.csv_no_rows": "没有可导出的行。",
+        "recv.csv_failed": "导出失败",
         "recv.log": "日志",
         "recv.remote_monitor": "发送端同步监控",
         "recv.remote_address": "发送端地址:",
@@ -89,6 +93,11 @@ STRINGS: dict[str, dict[str, str]] = {
         "send.source": "源 IP:",
         "send.placeholder_source": "可选源 IP",
         "send.ttl": "TTL / 跳数限制:",
+        "send.dscp": "DSCP 标记:",
+        "send.dscp_hint": (
+            "DSCP (0-63)。IPv4 写入 TOS 字段，IPv6 尽力设置 Traffic Class。\n"
+            "常用值: EF=46, AF41=34, CS5=40。0 表示不标记。"
+        ),
         "send.payload": "载荷大小 (字节):",
         "send.mode": "模式:",
         "send.count": "数量:",
@@ -139,12 +148,14 @@ STRINGS: dict[str, dict[str, str]] = {
         "col.bytes": "字节",
         "col.rate_pps": "速率 (pps)",
         "col.rate_bps": "速率 (bps)",
+        "col.loss": "丢包",
         "col.elapsed": "已运行",
         # About
         "about.title": "关于组播测试工具",
         "about.body": (
             "<b>组播测试工具</b><br>"
             "IGMP/MLD 加入、IPv4/IPv6 组播发送、实时统计，"
+            "支持基于序列号的丢包检测与 DSCP 流量标记，"
             "并可将发送端速率同步到接收端统一显示。<br><br>"
             "基于 Python + PySide6，标准 socket API，"
             "无需 raw socket。"
@@ -158,7 +169,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "dlg.remote_addr_required": "请输入发送端地址（host:port）",
         "recv.log_row_removed": "row #{row_id} 移除",
         "recv.log_remote_disconnected": "remote sender: 断开",
-        "send.log_started": "开始发送: {family} {group}:{port} mode={mode} ttl={ttl} payload={payload}",
+        "send.log_started": "开始发送: {family} {group}:{port} mode={mode} ttl={ttl} dscp={dscp} payload={payload}",
         "send.log_stopped": "stop: {sent} 包已发送",
     },
     "en": {
@@ -190,8 +201,12 @@ STRINGS: dict[str, dict[str, str]] = {
         "recv.active": "Active memberships",
         "recv.btn_remove": "Remove Selected",
         "recv.btn_stop_all": "Stop All",
-        "recv.btn_reset_counters": "Reset Counters (selected)",
+        "recv.btn_reset_counters": "Reset Counters",
         "recv.btn_reset_columns": "Reset Column Widths",
+        "recv.btn_export_csv": "Export CSV",
+        "recv.csv_written": "Exported {rows} rows to {path}",
+        "recv.csv_no_rows": "Nothing to export.",
+        "recv.csv_failed": "Export failed",
         "recv.log": "Log",
         "recv.remote_monitor": "Remote sender monitor",
         "recv.remote_address": "Sender address:",
@@ -226,6 +241,12 @@ STRINGS: dict[str, dict[str, str]] = {
         "send.source": "Source IP:",
         "send.placeholder_source": "optional source IP",
         "send.ttl": "TTL / Hop Limit:",
+        "send.dscp": "DSCP marking:",
+        "send.dscp_hint": (
+            "DSCP (0-63). IPv4 sets the TOS field; IPv6 sets the Traffic "
+            "Class when the platform supports it.\n"
+            "Common values: EF=46, AF41=34, CS5=40. 0 means unmarked."
+        ),
         "send.payload": "Payload size (bytes):",
         "send.mode": "Mode:",
         "send.count": "Count:",
@@ -274,11 +295,13 @@ STRINGS: dict[str, dict[str, str]] = {
         "col.bytes": "Bytes",
         "col.rate_pps": "Rate (pps)",
         "col.rate_bps": "Rate (bps)",
+        "col.loss": "Loss",
         "col.elapsed": "Elapsed",
         "about.title": "About Multicast Test Tool",
         "about.body": (
             "<b>Multicast Test Tool</b><br>"
             "IGMP / MLD join, IPv4 / IPv6 multicast send, real-time statistics, "
+            "sequence-based loss detection, DSCP marking, "
             "with optional sender-rate sync to the receiver.<br><br>"
             "Built with Python + PySide6, standard socket APIs only -- no raw socket required."
         ),
@@ -290,7 +313,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "dlg.remote_addr_required": "Please enter sender address (host:port)",
         "recv.log_row_removed": "row #{row_id} removed",
         "recv.log_remote_disconnected": "remote sender: disconnected",
-        "send.log_started": "start: {family} {group}:{port} mode={mode} ttl={ttl} payload={payload}",
+        "send.log_started": "start: {family} {group}:{port} mode={mode} ttl={ttl} dscp={dscp} payload={payload}",
         "send.log_stopped": "stop: {sent} packets sent",
     },
 }

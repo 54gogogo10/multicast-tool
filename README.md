@@ -25,6 +25,26 @@ watch real-time receive statistics (packet count, byte count, pps, bps).
   interface.
 - **Real-time statistics** — 1-second sliding window pps / bps, plus
   cumulative packet and byte counts and per-row elapsed time.
+- **Sequence-based loss detection** — when the default payload is used,
+  the sender embeds a `MCT1` header (`magic + session id + 32-bit
+  sequence + timestamp`, 20 bytes). The receiver tracks each
+  (source, session) stream and reports lost / out-of-order / duplicate
+  packets and a loss percentage in the *Loss* column. 32-bit sequence
+  wrap-around is handled in circular sequence space; at most 64 streams
+  are tracked per receiver (least-recently-seen evicted). Fixed-text
+  template payloads carry no header and are counted but not tracked.
+  *Trust model:* any host on the multicast group can forge `MCT1`
+  headers and skew the loss numbers — UDP multicast has no
+  authentication, so treat the loss column as a measurement of the
+  delivery path, not a security control.
+- **DSCP / TOS marking** — the sender can mark traffic with a DSCP value
+  (0–63, e.g. EF=46, AF41=34). IPv4 sets the TOS field via `IP_TOS`;
+  IPv6 sets the Traffic Class via `IPV6_TCLASS` when the platform
+  supports it (Winsock does not — the option is skipped with a log note).
+- **CSV export** — export the receive table (headers included) to a
+  UTF-8/Excel-friendly CSV file. Cells that could be interpreted as
+  spreadsheet formulas (`=`, `+`, `-`, `@`, tab, CR) are neutralised
+  with a leading apostrophe.
 - **Sender-rate synchronisation** — the sender tab can optionally expose
   its live stats (`sent` / `bytes` / `pps` / `bps` / `elapsed` / target)
   over a tiny HTTP server (`GET /stats`). The receiver tab can poll any
@@ -248,14 +268,18 @@ curl http://192.168.1.10:8765/stats
 
 ## Self-test
 
-Five headless test scripts cover different layers:
+Headless test scripts cover different layers:
 
 ```bash
-python _selftest.py      # core / stats / multicast roundtrip
-python _uitest.py        # window opens and closes cleanly
-python _colwidth_test.py # receive-table column resize + persistence
-python _remote_test.py   # sender-rate sync end-to-end
-python _i18n_test.py     # language switcher
+python _selftest.py        # core / stats / multicast roundtrip
+python _uitest.py          # window opens and closes cleanly
+python _colwidth_test.py   # receive-table column resize + persistence
+python _remote_test.py     # sender-rate sync end-to-end
+python _i18n_test.py       # language switcher
+python _sender_done_test.py  # sender tab state after a send finishes
+python _security_test.py   # remote.py host:port validation
+python _audit_round3_test.py  # round-3 audit fixes (zone-id/TTL/stop race/...)
+python _feature_test.py    # loss detection / DSCP / CSV export
 ```
 
 ## Tips

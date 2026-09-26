@@ -1,15 +1,18 @@
 """Thread-safe sliding-window statistics tracker for multicast receivers.
 
 Tracks per-receiver packet/byte counters and computes real-time pps / bps
-over a configurable sliding window (default 1 second).
+over a configurable sliding window (default 1 second). Also hosts the CSV
+export helper used by the receive table.
 """
 
 from __future__ import annotations
 
 import collections
+import csv
 import threading
 import time
 from dataclasses import dataclass
+from typing import Sequence
 
 
 @dataclass(frozen=True)
@@ -109,3 +112,38 @@ def format_rate_bps(bps: float) -> str:
             return f"{v:,.2f} {unit}"
         v /= 1000.0
     return f"{v:,.2f} Tbps"
+
+
+# --------------------------------------------------------------------------- #
+# CSV export                                                                  #
+# --------------------------------------------------------------------------- #
+
+# OWASP CSV-injection prefixes: when a spreadsheet application opens the
+# file, a cell starting with one of these characters may be interpreted as
+# a formula. Such cells get a leading apostrophe so they render as text.
+_CSV_RISK_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe_cell(value: object) -> str:
+    """Return ``value`` as a string that is inert inside a spreadsheet."""
+    s = str(value)
+    if s.startswith(_CSV_RISK_PREFIXES):
+        return "'" + s
+    return s
+
+
+def write_csv(path: str, header: Sequence[object],
+              rows: Sequence[Sequence[object]]) -> int:
+    """Write a CSV file; returns the number of data rows written.
+
+    Encoding is UTF-8 with a BOM so Excel detects it for non-ASCII text.
+    Raises OSError on unwritable paths.
+    """
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([csv_safe_cell(h) for h in header])
+        n = 0
+        for row in rows:
+            w.writerow([csv_safe_cell(c) for c in row])
+            n += 1
+    return n

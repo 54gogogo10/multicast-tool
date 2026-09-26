@@ -40,7 +40,16 @@ python _security_test.py   # remote.py host:port validation
 python _audit_round3_test.py  # audit fixes: zone-id/TTL validation, stop
                               # race, socket close, poller resilience,
                               # exporter isolation, Server header
+python _feature_test.py    # loss detection (SeqTracker/MCT1 header),
+                           # DSCP marking, CSV export
+python _audit_round4_test.py  # round-4 audit fixes: loss accounting
+                              # (reorder/stale-dup), CSV error paths,
+                              # hostile packets, DSCP degrade, i18n
+python _layout_audit.py   # GUI occlusion/clipping gate (real platform
+                          # on Windows, offscreen elsewhere); exits 1 on
+                          # any clipped widget at min/default window size
 ```
+`AUDIT.md` documents each audit round (latest: the round-4 series).
 
 Builds (Windows): `build.bat` (PySide6 onedir), `build.bat onefile`,
 `build.bat win7` and `build.bat onefile-win7` (PySide2, require

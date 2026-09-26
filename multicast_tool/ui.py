@@ -27,7 +27,7 @@ from typing import Optional
 # Qt binding shim: PySide6 (default, Windows 10+) or PySide2 (Win7 build).
 from .qt_compat import (
     Qt, QTimer, QByteArray, QEvent, QSettings, Signal, QObject,
-    QApplication, QAction, QKeySequence, QPalette,
+    QApplication, QAction, QKeySequence, QPalette, QFileDialog,
     QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
@@ -58,7 +58,9 @@ from .remote import (
     RemoteSenderSnapshot,
     StatsExporter,
 )
-from .stats import StatsSnapshot, StatsTracker, format_bytes, format_rate_bps
+from .stats import (
+    StatsSnapshot, StatsTracker, format_bytes, format_rate_bps, write_csv,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -171,8 +173,11 @@ class ReceiveTab(QWidget):
     HEADER_KEYS = [
         "col.idx", "col.group", "col.port", "col.iface", "col.version",
         "col.sources", "col.packets", "col.bytes", "col.rate_pps",
-        "col.rate_bps", "col.elapsed",
+        "col.rate_bps", "col.loss", "col.elapsed",
     ]
+
+    # Default widths for a fresh table (one entry per column above).
+    DEFAULT_WIDTHS = [40, 200, 60, 120, 80, 120, 90, 100, 90, 110, 60, 80]
 
     def __init__(self, state: AppState, bus: _SignalBus, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -231,7 +236,7 @@ class ReceiveTab(QWidget):
         box = QGroupBox()
         self._widgets["recv.add_group"] = box
         form = QFormLayout(box)
-        form.setSpacing(8)
+        form.setSpacing(6)
 
         self.family_combo = QComboBox()
         self.iface_combo = QComboBox()
@@ -259,7 +264,7 @@ class ReceiveTab(QWidget):
         form.addRow(self._widgets["recv.add_version"], self.version_combo)
         form.addRow(self._widgets["recv.add_sources"], self.sources_edit)
         form.addRow("", self.add_btn)
-        layout.addWidget(box, 3)
+        layout.addWidget(box, 2)
 
     def _build_remote_panel(self, layout) -> None:
         box = QGroupBox()
@@ -267,11 +272,17 @@ class ReceiveTab(QWidget):
         outer = QVBoxLayout(box)
         outer.setSpacing(8)
 
-        # Address + interval row
+        # Two rows: the address row, then interval + connect controls.
+        # One row cannot fit the English labels/buttons without clipping.
         top = QHBoxLayout()
         self.remote_addr_label = QLabel()
         self.remote_addr_edit = QLineEdit()
         self.remote_addr_edit.setPlaceholderText(i18n.t("recv.remote_address_ph"))
+        top.addWidget(self.remote_addr_label)
+        top.addWidget(self.remote_addr_edit, 1)
+        outer.addLayout(top)
+
+        ctl = QHBoxLayout()
         self.remote_interval_label = QLabel()
         self.remote_interval = QDoubleSpinBox()
         self.remote_interval.setRange(0.2, 60.0)
@@ -282,17 +293,13 @@ class ReceiveTab(QWidget):
         self.remote_connect_btn = QPushButton()
         self.remote_disconnect_btn = QPushButton()
         self.remote_disconnect_btn.setEnabled(False)
-
-        top.addWidget(self.remote_addr_label)
-        top.addWidget(self.remote_addr_edit, 1)
-        top.addSpacing(8)
-        top.addWidget(self.remote_interval_label)
-        top.addWidget(self.remote_interval)
-        top.addWidget(self.remote_interval_unit)
-        top.addSpacing(8)
-        top.addWidget(self.remote_connect_btn)
-        top.addWidget(self.remote_disconnect_btn)
-        outer.addLayout(top)
+        ctl.addWidget(self.remote_interval_label)
+        ctl.addWidget(self.remote_interval)
+        ctl.addWidget(self.remote_interval_unit)
+        ctl.addStretch(1)
+        ctl.addWidget(self.remote_connect_btn)
+        ctl.addWidget(self.remote_disconnect_btn)
+        outer.addLayout(ctl)
 
         # Status row
         status_row = QHBoxLayout()
@@ -304,7 +311,7 @@ class ReceiveTab(QWidget):
 
         # Stats grid (two columns of label/value pairs)
         grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
+        grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(4)
         self.remote_target_label = QLabel()
         self.remote_target_value = QLabel("--")
@@ -332,8 +339,11 @@ class ReceiveTab(QWidget):
             (self.remote_pps_label,     self.remote_pps_value),
             (self.remote_bps_label,     self.remote_bps_value),
         ]
+        # Two pairs per row: four-across cannot hold the English labels.
+        # The extra rows stay below the add-panel's height, so the top
+        # area's size does not grow.
         for i, (lbl, val) in enumerate(labels_values):
-            r, c = divmod(i, 4)
+            r, c = divmod(i, 2)
             grid.addWidget(lbl, r, c * 2)
             grid.addWidget(val, r, c * 2 + 1)
         outer.addLayout(grid)
@@ -360,7 +370,7 @@ class ReceiveTab(QWidget):
         row.setSpacing(10)
         for key in ("recv.tile.groups", "recv.tile.packets",
                     "recv.tile.bytes", "recv.tile.rate"):
-            frame, pair = _stat_tile(key, 74)
+            frame, pair = _stat_tile(key, 68)
             row.addWidget(frame, 1)
             self._tiles[key] = pair
         return row
@@ -381,10 +391,13 @@ class ReceiveTab(QWidget):
         hdr = self.table.horizontalHeader()
         for i in range(len(self.HEADER_KEYS)):
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
-        for col, w in enumerate([40, 200, 60, 120, 80, 120, 90, 100, 90, 110, 80]):
+        for col, w in enumerate(self.DEFAULT_WIDTHS):
             self.table.setColumnWidth(col, w)
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.table.setMinimumHeight(140)
+        # Table card + log in a vertical splitter. Minimum heights are kept
+        # deliberately small so the tab's layout minimum fits the window
+        # minimum (the splitter, not hard minimums, owns the size split).
+        self.table.setMinimumHeight(80)
         self._group_user_resized = False
         self._suppress_resize_signal = False
         hdr.sectionResized.connect(self._on_section_resized)
@@ -397,15 +410,18 @@ class ReceiveTab(QWidget):
         bar = QHBoxLayout()
         self.remove_btn = QPushButton()
         self.clear_btn = QPushButton()
+        self.export_btn = QPushButton()
         self.reset_cols_btn = QPushButton()
         self.stop_all_btn = QPushButton()
         self.stop_all_btn.setObjectName("danger")
         self._widgets["recv.btn_remove"] = self.remove_btn
         self._widgets["recv.btn_reset_counters"] = self.clear_btn
+        self._widgets["recv.btn_export_csv"] = self.export_btn
         self._widgets["recv.btn_reset_columns"] = self.reset_cols_btn
         self._widgets["recv.btn_stop_all"] = self.stop_all_btn
         bar.addWidget(self.remove_btn)
         bar.addWidget(self.clear_btn)
+        bar.addWidget(self.export_btn)
         bar.addWidget(self.reset_cols_btn)
         bar.addStretch(1)
         bar.addWidget(self.stop_all_btn)
@@ -420,7 +436,7 @@ class ReceiveTab(QWidget):
         self.log.setObjectName("logEdit")
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(2000)
-        self.log.setMinimumHeight(80)
+        self.log.setMinimumHeight(48)
         llay.addWidget(self.log)
 
     def _wire(self) -> None:
@@ -428,6 +444,7 @@ class ReceiveTab(QWidget):
         self.remove_btn.clicked.connect(self._on_remove_clicked)
         self.stop_all_btn.clicked.connect(self._on_stop_all_clicked)
         self.clear_btn.clicked.connect(self._on_clear_counters_clicked)
+        self.export_btn.clicked.connect(self._on_export_csv_clicked)
         self.reset_cols_btn.clicked.connect(self._on_reset_columns_clicked)
         self.family_combo.currentTextChanged.connect(self._on_family_changed)
         self.bus.receiver_event.connect(self._on_receiver_event)
@@ -597,6 +614,43 @@ class ReceiveTab(QWidget):
         row = self.state.receivers.get(row_id)
         if row is not None:
             row.stats.reset()
+            try:
+                row.receiver.reset_loss()
+            except Exception:  # noqa: BLE001
+                logger.exception("reset loss tracker")
+
+    def _on_export_csv_clicked(self) -> None:
+        rows = self._collect_table_rows()
+        if not rows:
+            QMessageBox.information(
+                self, i18n.t("recv.btn_export_csv"), i18n.t("recv.csv_no_rows")
+            )
+            return
+        path, _flt = QFileDialog.getSaveFileName(
+            self, i18n.t("recv.btn_export_csv"), "receive_stats.csv",
+            "CSV (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        headers = [i18n.t(k) for k in self.HEADER_KEYS]
+        try:
+            n = write_csv(path, headers, rows)
+        except Exception as e:  # noqa: BLE001 - surface any write failure in the UI
+            logger.exception("CSV export failed: %s", path)
+            QMessageBox.critical(self, i18n.t("recv.csv_failed"), f"{path}\n{e}")
+            return
+        self._append_log(i18n.t("recv.csv_written").format(rows=n, path=path))
+
+    def _collect_table_rows(self) -> list[list[str]]:
+        ncols = len(self.HEADER_KEYS)
+        out: list[list[str]] = []
+        for r in range(self.table.rowCount()):
+            cells: list[str] = []
+            for c in range(ncols):
+                item = self.table.item(r, c)
+                cells.append(item.text() if item is not None else "")
+            out.append(cells)
+        return out
 
     def _on_reset_columns_clicked(self) -> None:
         self._settings.remove("receive_table_header")
@@ -604,7 +658,7 @@ class ReceiveTab(QWidget):
         hdr = self.table.horizontalHeader()
         for i in range(len(self.HEADER_KEYS)):
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
-        for col, w in enumerate([40, 200, 60, 120, 80, 120, 90, 100, 90, 110, 80]):
+        for col, w in enumerate(self.DEFAULT_WIDTHS):
             self.table.setColumnWidth(col, w)
         self._group_user_resized = False
         self._refill_group_column()
@@ -837,7 +891,19 @@ class ReceiveTab(QWidget):
             bps_item = self.table.item(r, 9)
             bps_item.setText(format_rate_bps(snap.bps))
             bps_item.setForeground(_color_for_pps(snap.pps))
-            self.table.item(r, 10).setText(_format_elapsed(snap.elapsed_sec))
+            loss_item = self.table.item(r, 10)
+            try:
+                loss = row.receiver.loss_snapshot()
+            except Exception:  # noqa: BLE001
+                logger.exception("loss snapshot failed")
+                loss = None
+            lost_count = loss.lost if loss is not None else 0
+            if loss is not None and loss.expected > 0:
+                loss_item.setText(f"{loss.lost:,} ({loss.loss_pct:.2f}%)")
+            else:
+                loss_item.setText("\u2014")
+            loss_item.setForeground(theme.loss_color(lost_count))
+            self.table.item(r, 11).setText(_format_elapsed(snap.elapsed_sec))
             tot_packets += snap.total_packets
             tot_bytes += snap.total_bytes
             tot_pps += snap.pps
@@ -870,6 +936,7 @@ class SendTab(QWidget):
         self.bus = bus
         self._widgets: dict[str, QWidget] = {}
         self._tiles: dict[str, tuple[QLabel, QLabel]] = {}
+        self._form_labels: list[QLabel] = []   # send-parameter form labels
         self._build_ui()
         self._wire()
 
@@ -914,6 +981,7 @@ class SendTab(QWidget):
         self.s_iface.setEditable(True)
         self.s_source = QLineEdit()
         self.s_ttl = QSpinBox(); self.s_ttl.setRange(0, 255); self.s_ttl.setValue(1)
+        self.s_dscp = QSpinBox(); self.s_dscp.setRange(0, 63); self.s_dscp.setValue(0)
         self.s_payload = QSpinBox(); self.s_payload.setRange(0, 65507); self.s_payload.setValue(1024); self.s_payload.setSingleStep(64)
         self.s_mode = QComboBox()
         self.s_count = QSpinBox(); self.s_count.setRange(1, 10_000_000); self.s_count.setValue(1000)
@@ -953,6 +1021,7 @@ class SendTab(QWidget):
         ]
         right_rows: list[tuple[str, QWidget, QWidget]] = [
             ("send.ttl", self.s_ttl, self.s_ttl),
+            ("send.dscp", self.s_dscp, self.s_dscp),
             ("send.payload", self.s_payload, self.s_payload),
             ("send.mode", self.s_mode, self.s_mode),
             ("send.count", self.s_count, self.s_count),
@@ -966,6 +1035,7 @@ class SendTab(QWidget):
                 lbl.setBuddy(buddy)
                 form.addRow(lbl, field_widget)
                 self._widgets[key] = lbl
+                self._form_labels.append(lbl)
         cols = QHBoxLayout()
         cols.setSpacing(16)
         cols.addLayout(left_form, 1)
@@ -1007,7 +1077,7 @@ class SendTab(QWidget):
         grid = QGridLayout()
         grid.setSpacing(10)
         for i, key in enumerate(self.TILE_KEYS):
-            frame, pair = _stat_tile(key, 64)
+            frame, pair = _stat_tile(key, 68)
             r, c = divmod(i, 2)
             grid.addWidget(frame, r, c)
             self._tiles[key] = pair
@@ -1068,7 +1138,7 @@ class SendTab(QWidget):
         self.s_log.setObjectName("logEdit")
         self.s_log.setReadOnly(True)
         self.s_log.setMaximumBlockCount(2000)
-        self.s_log.setMinimumHeight(110)
+        self.s_log.setMinimumHeight(48)
         llay.addWidget(self.s_log)
         layout.addWidget(box, 1)
 
@@ -1095,6 +1165,10 @@ class SendTab(QWidget):
                 w.setText(text)
         for key in self.TILE_KEYS:
             self._tiles[key][0].setText(i18n.t(key))
+        # Labels bid their full text width as a minimum, so a narrow window
+        # squeezes the input fields first -- never the labels down to zero.
+        for lbl in self._form_labels:
+            lbl.setMinimumWidth(lbl.sizeHint().width())
         # Family combo (use translated labels but keep enum value identifiable)
         family = self._current_family()
         fam_items = [i18n.t(f"family.{f.value.lower()}") for f in AddressFamily]
@@ -1110,6 +1184,8 @@ class SendTab(QWidget):
         _fill_combo(self.s_mode, mode_items, i18n.t(f"mode.{cur_match.value}"))
         # Rate unit suffix
         self._rate_unit_label.setText(i18n.t("send.unit_pps"))
+        # DSCP tooltip
+        self.s_dscp.setToolTip(i18n.t("send.dscp_hint"))
         # Defaults
         self.s_source.setPlaceholderText(i18n.t("send.placeholder_source"))
         # Exporter status
@@ -1174,6 +1250,7 @@ class SendTab(QWidget):
                 iface = ""
             source = self.s_source.text().strip()
             ttl = int(self.s_ttl.value())
+            dscp = int(self.s_dscp.value())
             payload_size = int(self.s_payload.value())
             mode_cur = self.s_mode.currentText()
             mode = next(
@@ -1194,7 +1271,7 @@ class SendTab(QWidget):
 
         cfg = SenderConfig(
             family=family, group=group, port=port, interface=iface, source=source,
-            ttl=ttl, payload_size=payload_size, mode=mode, count=count,
+            ttl=ttl, dscp=dscp, payload_size=payload_size, mode=mode, count=count,
             rate_pps=rate, payload_template=template,
         )
         sender = MulticastSender(cfg)
@@ -1213,7 +1290,7 @@ class SendTab(QWidget):
         self.s_progress.setValue(0)
         self._append_log(i18n.t("send.log_started").format(
             family=family.value, group=group, port=port, mode=mode.value,
-            ttl=ttl, payload=payload_size,
+            ttl=ttl, dscp=dscp, payload=payload_size,
         ))
         # If a stats exporter is running, rebuild its provider
         self._refresh_exporter_provider()
@@ -1412,8 +1489,11 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.send_tab, i18n.t("tab.send"))
         self.setCentralWidget(self.tabs)
 
-        self.resize(1200, 780)
-        self.setMinimumSize(1000, 660)
+        self.resize(1280, 820)
+        # Matches the layout's real minimum (audited by _layout_audit.py):
+        # declaring a smaller floor let windows shrink into a state where
+        # labels and the receive table were clipped.
+        self.setMinimumSize(1208, 800)
 
         # Status bar
         sb = QStatusBar()

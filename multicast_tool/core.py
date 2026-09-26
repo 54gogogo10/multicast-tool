@@ -34,6 +34,9 @@ IP_ADD_SOURCE_MEMBERSHIP = getattr(socket, "IP_ADD_SOURCE_MEMBERSHIP", 15)
 IP_DROP_SOURCE_MEMBERSHIP = getattr(socket, "IP_DROP_SOURCE_MEMBERSHIP", 16)
 IPV6_JOIN_GROUP = getattr(socket, "IPV6_JOIN_GROUP", 12)
 IPV6_LEAVE_GROUP = getattr(socket, "IPV6_LEAVE_GROUP", 13)
+# Linux: 36. Winsock has no IPV6_TCLASS; the setsockopt attempt fails with
+# WSAENOPROTOOPT and the sender degrades to unmarked traffic (logged).
+IPV6_TCLASS = getattr(socket, "IPV6_TCLASS", 36)
 
 
 # --------------------------------------------------------------------------- #
@@ -61,6 +64,144 @@ class MldVersion(str, enum.Enum):
 
     V1 = "MLDv1"
     V2 = "MLDv2"
+
+
+# --------------------------------------------------------------------------- #
+# Sequence tracking (packet loss detection)                                   #
+# --------------------------------------------------------------------------- #
+
+# Payload header embedded by MulticastSender when no fixed template is used:
+#   magic "MCT1" | session id | sequence | wall-clock timestamp  (!4sIId, 20B)
+# The receiver uses it to compute per-source loss / reorder / duplicate
+# counts. Packets that do not carry the header (template payloads, foreign
+# traffic, truncated packets) are counted but not sequence-tracked.
+PAYLOAD_MAGIC = b"MCT1"
+_PAYLOAD_HEADER = struct.Struct("!4sIId")
+PAYLOAD_HEADER_SIZE = _PAYLOAD_HEADER.size  # 20
+_SEQ_MOD = 1 << 32
+# Forward distance below this threshold means "in order or gap"; a larger
+# unsigned distance means the sequence wrapped through zero.
+_SEQ_WRAP_HALF = 1 << 31
+# Cap on concurrently tracked (source, session) streams. Untrusted hosts
+# on the same group could otherwise grow the table without bound by
+# spoofing fresh session ids; the least-recently-seen stream is evicted.
+MAX_SEQ_STREAMS = 64
+# Per-stream receipt bitmap window (in sequence numbers, relative to the
+# highest sequence seen). Lets the tracker tell a duplicate of an
+# already-received packet apart from a late packet that fills a previously
+# counted hole, so loss is not double-counted after a reorder.
+_SEQ_WINDOW_BITS = 64
+_SEQ_BITMAP_MASK = (1 << _SEQ_WINDOW_BITS) - 1
+
+
+@dataclass(frozen=True)
+class LossSnapshot:
+    """Aggregate sequence-tracking result across all (source, session) streams."""
+
+    streams: int = 0        # tracked (source, session) streams
+    received: int = 0       # sequence-tracked packets
+    lost: int = 0           # gaps in the sequence space
+    out_of_order: int = 0   # late (reordered) packets
+    duplicates: int = 0     # retransmissions of an already-seen sequence
+
+    @property
+    def expected(self) -> int:
+        return self.received + self.lost
+
+    @property
+    def loss_pct(self) -> float:
+        exp = self.expected
+        return (100.0 * self.lost / exp) if exp else 0.0
+
+
+@dataclass
+class _StreamState:
+    max_seq: int            # highest (circular) sequence received
+    received: int = 1
+    lost: int = 0
+    out_of_order: int = 0
+    duplicates: int = 0
+    bitmap: int = 1         # bit k set == sequence (max_seq - k) received
+    last_seen: float = 0.0
+
+
+class SeqTracker:
+    """Thread-safe per-(source, session) sequence tracker.
+
+    ``feed`` is called by the receiver thread for every packet that carries
+    the tool's payload header; ``snapshot`` is called by the GUI thread.
+
+    Accounting rules (all distances in circular 32-bit sequence space):
+
+    * a packet at or beyond ``max_seq`` advances the stream; the gap it
+      reveals is added to ``lost``;
+    * a packet *behind* ``max_seq`` is a duplicate when its sequence is in
+      the receipt bitmap, otherwise it is a late packet that fills a hole
+      previously counted as lost (``lost`` is compensated, the packet is
+      counted ``out_of_order``);
+    * packets from further back than the bitmap window count as stale
+      duplicates and do not touch the loss estimate.
+    """
+
+    def __init__(self, max_streams: int = MAX_SEQ_STREAMS) -> None:
+        self._lock = threading.Lock()
+        self._streams: dict[tuple[str, int], _StreamState] = {}
+        self._max_streams = max(1, int(max_streams))
+
+    def feed(self, source: str, session: int, seq: int) -> None:
+        now = time.monotonic()
+        with self._lock:
+            st = self._streams.get((source, session))
+            if st is None:
+                if len(self._streams) >= self._max_streams:
+                    oldest = min(self._streams, key=lambda k: self._streams[k].last_seen)
+                    del self._streams[oldest]
+                self._streams[(source, session)] = _StreamState(
+                    max_seq=seq, received=1, bitmap=1, last_seen=now,
+                )
+                return
+            st.last_seen = now
+            d = (seq - st.max_seq) & (_SEQ_MOD - 1)
+            if d == 0:
+                st.duplicates += 1
+            elif d < _SEQ_WRAP_HALF:
+                # Forward advance: everything between the old max and seq
+                # (exclusive) was never seen here -> lost.
+                st.lost += d - 1
+                st.received += 1
+                st.bitmap = ((st.bitmap << d) | 1) & _SEQ_BITMAP_MASK
+                st.max_seq = seq
+            else:
+                back = (st.max_seq - seq) & (_SEQ_MOD - 1)  # >= 1
+                if back >= _SEQ_WINDOW_BITS:
+                    # Far behind the window: stale retransmission (or an
+                    # attacker's replay); never compensate loss for it.
+                    st.duplicates += 1
+                    return
+                bit = 1 << back
+                if st.bitmap & bit:
+                    st.duplicates += 1
+                else:
+                    # Late packet filling a hole we already counted as lost.
+                    st.out_of_order += 1
+                    st.received += 1
+                    st.lost = max(0, st.lost - 1)
+                    st.bitmap |= bit
+
+    def reset(self) -> None:
+        with self._lock:
+            self._streams.clear()
+
+    def snapshot(self) -> LossSnapshot:
+        with self._lock:
+            streams = self._streams.values()
+            return LossSnapshot(
+                streams=len(self._streams),
+                received=sum(s.received for s in streams),
+                lost=sum(s.lost for s in streams),
+                out_of_order=sum(s.out_of_order for s in streams),
+                duplicates=sum(s.duplicates for s in streams),
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -526,6 +667,7 @@ class MulticastReceiver:
         self._running = threading.Event()
         self._joined = False
         self._error: Optional[str] = None
+        self._seq = SeqTracker()
 
     # -- public ------------------------------------------------------------ #
 
@@ -535,6 +677,14 @@ class MulticastReceiver:
     @property
     def last_error(self) -> Optional[str]:
         return self._error
+
+    def loss_snapshot(self) -> LossSnapshot:
+        """Aggregate loss / reorder / duplicate counts for this receiver."""
+        return self._seq.snapshot()
+
+    def reset_loss(self) -> None:
+        """Forget all sequence-tracking state (paired with StatsTracker.reset)."""
+        self._seq.reset()
 
     def start(self) -> None:
         if self._running.is_set():
@@ -800,7 +950,7 @@ class MulticastReceiver:
         sock = self._sock
         while self._running.is_set():
             try:
-                data, _addr = sock.recvfrom(65535)
+                data, addr = sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except OSError as e:
@@ -820,6 +970,26 @@ class MulticastReceiver:
                 self._emit(ReceiverEventType.ERROR, f"recv error: {e}")
                 break
             self.stats.record(len(data))
+            self._track_seq(data, addr)
+
+    def _track_seq(self, data: bytes, addr) -> None:
+        """Feed the sequence tracker when the packet carries our header.
+
+        Hostile or foreign traffic must never break the receive loop, so
+        every failure mode here degrades to "packet counted, not tracked".
+        """
+        try:
+            if len(data) < PAYLOAD_HEADER_SIZE:
+                return
+            magic, session, seq, _ts = _PAYLOAD_HEADER.unpack_from(data, 0)
+            if magic != PAYLOAD_MAGIC:
+                return
+            src = addr[0] if isinstance(addr, tuple) else str(addr)
+            if not isinstance(src, str):
+                return
+            self._seq.feed(src, session, seq)
+        except Exception:  # noqa: BLE001 - never let tracking kill receive
+            logger.debug("sequence tracking failed for a packet", exc_info=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -846,6 +1016,7 @@ class SenderConfig:
     count: int = 1000           # for burst / target for rate-limited
     rate_pps: int = 1000        # for rate-limited
     payload_template: bytes = b""  # if non-empty, sent as-is; else random bytes
+    dscp: int = 0               # 0-63; IPv4 IP_TOS / IPv6 Traffic Class (best effort)
 
 
 class SenderEventType(str, enum.Enum):
@@ -878,6 +1049,7 @@ class MulticastSender:
         self._stop_requested = threading.Event()
         self._sent = 0
         self._error: Optional[str] = None
+        self._session_id: int = 0
         # Stats for the optional remote-monitor feature
         self.stats: StatsTracker = StatsTracker()
 
@@ -905,12 +1077,15 @@ class MulticastSender:
             raise ValueError(f"Port out of range: {self.config.port}")
         if not (0 <= self.config.ttl <= 255):
             raise ValueError(f"TTL / hop limit out of range: {self.config.ttl}")
+        if not (0 <= self.config.dscp <= 63):
+            raise ValueError(f"DSCP out of range (0-63): {self.config.dscp}")
         if self.config.payload_size < 0 or self.config.payload_size > 65507:
             raise ValueError(f"Payload size out of range: {self.config.payload_size}")
 
         sock = self._make_socket()
         self._sock = sock
         self._sent = 0
+        self._session_id = random.randrange(_SEQ_MOD)
         self._stop_requested.clear()
         self._running.set()
         self._thread = threading.Thread(
@@ -966,6 +1141,10 @@ class MulticastSender:
                     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, ifaddr)
             # TTL
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, self.config.ttl)
+            # DSCP -> whole TOS byte (DSCP occupies the top 6 bits)
+            if self.config.dscp:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS,
+                                (self.config.dscp & 0x3F) << 2)
             # Loopback enabled by default; leave as-is
         else:  # IPv6
             if self.config.source or self.config.interface:
@@ -982,6 +1161,17 @@ class MulticastSender:
                     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, idx)
             # Hop Limit
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, self.config.ttl)
+            # Traffic Class. Winsock has no IPV6_TCLASS; degrade to unmarked
+            # traffic instead of failing the whole send session.
+            if self.config.dscp:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IPV6, IPV6_TCLASS,
+                                    (self.config.dscp & 0x3F) << 2)
+                except OSError:
+                    logger.info(
+                        "IPV6_TCLASS is not supported on this platform; "
+                        "DSCP marking ignored for IPv6"
+                    )
         # Use a non-zero send buffer for higher throughput
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
 
@@ -990,6 +1180,10 @@ class MulticastSender:
         sock = self._sock
         target = (self.config.group, self.config.port)
         payload = self._build_payload()
+        # When the payload carries our sequence header it is a mutable
+        # bytearray; the first PAYLOAD_HEADER_SIZE bytes are rewritten with
+        # the per-packet sequence right before each send.
+        seq_buf = payload if isinstance(payload, bytearray) else None
         sent = 0
         errored = False
         target_count: Optional[int]
@@ -1016,8 +1210,13 @@ class MulticastSender:
             while not self._stop_requested.is_set():
                 if target_count is not None and sent >= target_count:
                     break
+                if seq_buf is not None:
+                    _PAYLOAD_HEADER.pack_into(
+                        seq_buf, 0, PAYLOAD_MAGIC, self._session_id,
+                        sent & (_SEQ_MOD - 1), time.time(),
+                    )
                 try:
-                    sock.sendto(payload, target)
+                    sock.sendto(seq_buf if seq_buf is not None else payload, target)
                 except OSError as e:
                     if self._stop_requested.is_set():
                         # stop() closed the socket mid-sendto; that is a
@@ -1068,18 +1267,27 @@ class MulticastSender:
                        else f"Done ({sent} sent)")
                 self._emit(SenderEventType.STOPPED, msg)
 
-    def _build_payload(self) -> bytes:
+    def _build_payload(self):
+        """Build the initial payload buffer.
+
+        Returns a ``bytearray`` carrying the MCT1 sequence header when the
+        default (non-template) payload has room for it -- the send loop then
+        rewrites the header per packet -- otherwise plain ``bytes``.
+        """
         if self.config.payload_template:
             # If size differs, pad or truncate to match
             t = self.config.payload_template
             if len(t) >= self.config.payload_size:
-                return t[: self.config.payload_size]
-            return t + b"\x00" * (self.config.payload_size - len(t))
-        # Random payload with a 16-byte header for identification
+                return bytes(t[: self.config.payload_size])
+            return bytes(t + b"\x00" * (self.config.payload_size - len(t)))
+        # Random payload with a 20-byte header (magic/session/seq/timestamp)
+        # so receivers can track loss per source.
         n = self.config.payload_size
         if n <= 0:
             return b""
-        header = struct.pack("!dI", time.time(), random.randrange(1 << 32))
+        header = _PAYLOAD_HEADER.pack(
+            PAYLOAD_MAGIC, self._session_id, 0, time.time()
+        )
         body_len = max(0, n - len(header))
         # random.randbytes is Python 3.9+; fall back to getrandbits for 3.8
         # (the Win7 build runs on Python 3.8).
@@ -1090,4 +1298,8 @@ class MulticastSender:
                 body = random.getrandbits(body_len * 8).to_bytes(body_len, "big")
         else:
             body = b""
-        return header + body
+        buf = bytearray(header + body)
+        if n < PAYLOAD_HEADER_SIZE:
+            # Too small to carry a parseable header: fixed bytes, untracked.
+            return bytes(buf[:n])
+        return buf
