@@ -613,6 +613,39 @@ def local_addresses(family: AddressFamily) -> list[str]:
     return out
 
 
+def interface_entries(family: AddressFamily) -> list[tuple[str, str]]:
+    """Enumerate local addresses as ``(ip, friendly_name)`` pairs.
+
+    Merges :func:`local_addresses` (resolver-based, may miss adapters) with
+    the adapter tables from :func:`_iface_tables` (complete on Windows /
+    Linux), so multi-NIC machines see every usable address. The friendly
+    name is the adapter display name (e.g. "Wi-Fi", "eth0") or "" when
+    unknown.
+    """
+    ip_to_index, name_to_ipv4, name_to_index = _iface_tables()[
+        0 if family is AddressFamily.IPV4 else 1
+    ]
+    labels: dict[str, str] = {}
+    if family is AddressFamily.IPV4:
+        for name, ip in name_to_ipv4.items():
+            labels.setdefault(ip, name)
+    else:
+        index_to_name = {idx: name for name, idx in name_to_index.items()}
+        for ip, idx in ip_to_index.items():
+            name = index_to_name.get(idx)
+            if name:
+                labels.setdefault(ip, name)
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for ip in local_addresses(family):
+        out.append((ip, labels.get(ip, "")))
+        seen.add(ip)
+    for ip in sorted(labels):
+        if ip not in seen:
+            out.append((ip, labels[ip]))
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Receiver                                                                    #
 # --------------------------------------------------------------------------- #
@@ -1108,7 +1141,10 @@ class MulticastSender:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
-        self._emit(SenderEventType.STOPPED, f"Sender stopped ({self._sent} sent)")
+        self._emit(
+            SenderEventType.STOPPED, f"Sender stopped ({self._sent} sent)",
+            sent=self._sent,
+        )
 
     def _emit(self, etype: SenderEventType, message: str = "", **kw) -> None:
         if self.on_event is None:
@@ -1265,7 +1301,10 @@ class MulticastSender:
                 self._running.clear()
                 msg = (f"Stopped after error ({sent} sent)" if errored
                        else f"Done ({sent} sent)")
-                self._emit(SenderEventType.STOPPED, msg)
+                self._emit(
+                    SenderEventType.STOPPED, msg,
+                    sent=sent, target=target_count or 0,
+                )
 
     def _build_payload(self):
         """Build the initial payload buffer.

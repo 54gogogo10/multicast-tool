@@ -45,6 +45,8 @@ python _feature_test.py    # loss detection (SeqTracker/MCT1 header),
 python _audit_round4_test.py  # round-4 audit fixes: loss accounting
                               # (reorder/stale-dup), CSV error paths,
                               # hostile packets, DSCP degrade, i18n
+python _settings_test.py   # form/geometry/language persistence +
+                           # final send-stats retention / done status
 python _layout_audit.py   # GUI occlusion/clipping gate (real platform
                           # on Windows, offscreen elsewhere); exits 1 on
                           # any clipped widget at min/default window size
@@ -76,8 +78,11 @@ Builds (Windows): `build.bat` (PySide6 onedir), `build.bat onefile`,
   does not exist in PySide6). The QSS deliberately sets no `color` for
   plain labels/table items so palette-based dynamic colors keep working.
 - **Persistence** uses `QSettings("multicast-tool", "Multicast Test Tool")`
-  (column widths, language). Keys are read at startup with defaults, so
-  don't rename them casually.
+  (column widths, theme, language, window geometry, and last-used form
+  values under `recv/last_*`, `send/last_*`). Keys are read at startup
+  with defaults, so don't rename them casually. Windows registry stores
+  bools as `"true"`/`"false"` strings — parse via ui.py's `_to_bool`,
+  not `bool(value)`.
 - `remote.py` deliberately rejects URLs/schemes/paths/bracketed IPv6 in
   `validate_host_port()` (SSRF hardening); `_security_test.py` pins this
   behavior — don't loosen it without updating that test.

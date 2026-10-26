@@ -51,9 +51,18 @@ watch real-time receive statistics (packet count, byte count, pps, bps).
   sender's URL and display those numbers alongside its own receive
   stats, so a single dashboard shows both ends of the pipe.
 - **Chinese / English UI** — the whole interface is translated; switch
-  languages live via *View → Language → 中文 / English*.
+  languages live via *View → Language → 中文 / English* (persisted).
 - **Dark / light theme** — modern card-based interface with dashboard
   stat tiles; switch via *View → Theme → 深色 / 浅色* (persisted).
+- **Session persistence & conveniences** — every form value (receive,
+  send, remote monitor, stats exporter), the window geometry, the
+  language and the theme survive restarts, so a repeat test is one
+  click away. Interface dropdowns label each IP with its adapter name
+  (e.g. `192.168.1.10 (Wi-Fi)`); the receive table supports
+  right-click → remove / reset counters and the `Delete` key; a
+  finished send keeps its final numbers on the tiles (with a
+  "Done (N packets)" status) instead of snapping back to zero; CSV
+  export suggests a timestamped filename.
 - **User-resizable columns** — all receive-table columns (including the
   Group address) can be dragged; widths persist across sessions.
 - **Pure standard library + PySide6** — no raw sockets, no admin rights
@@ -280,6 +289,10 @@ python _sender_done_test.py  # sender tab state after a send finishes
 python _security_test.py   # remote.py host:port validation
 python _audit_round3_test.py  # round-3 audit fixes (zone-id/TTL/stop race/...)
 python _feature_test.py    # loss detection / DSCP / CSV export
+python _audit_round4_test.py  # round-4 audit fixes (loss accounting, ...)
+python _settings_test.py   # form/geometry/language persistence + final
+                           # send stats retention
+python _layout_audit.py    # GUI occlusion gate (real platform on Windows)
 ```
 
 ## Tips

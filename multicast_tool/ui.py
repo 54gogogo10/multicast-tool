@@ -30,7 +30,7 @@ from .qt_compat import (
     QApplication, QAction, QKeySequence, QPalette, QFileDialog,
     QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
     QSpinBox, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget,
     QVBoxLayout, QWidget,
 )
@@ -49,6 +49,7 @@ from .core import (
     SenderEventType,
     SenderMode,
     MulticastSender,
+    interface_entries,
     is_multicast_group,
     local_addresses,
     parse_source_list,
@@ -141,6 +142,59 @@ def _fill_combo(combo: QComboBox, items: list[str], current: Optional[str] = Non
     combo.blockSignals(False)
 
 
+def _to_bool(v, default: bool = False) -> bool:
+    """Parse a QSettings bool; Windows backends store 'true'/'false' strings."""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("true", "1")
+
+
+def _to_int(v, default: int) -> int:
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(v, default: float) -> float:
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _menu_exec(menu: QMenu, pos) -> None:
+    """QMenu.exec on Qt 6, QMenu.exec_ on Qt 5."""
+    fn = getattr(menu, "exec", None) or getattr(menu, "exec_")
+    fn(pos)
+
+
+def _fill_iface_combo(combo: QComboBox, family: AddressFamily,
+                      display_to_ip: dict[str, str]) -> None:
+    """Populate an interface combo with 'ip (adapter name)' items.
+
+    ``display_to_ip`` is filled with the display-text -> plain-IP mapping
+    so readers can resolve the selection back to an IP (the combo is
+    editable, so arbitrary typed text is passed through unchanged). The
+    current selection is preserved across repopulation by value.
+    """
+    current = display_to_ip.get(combo.currentText().strip(), combo.currentText().strip())
+    display_to_ip.clear()
+    combo.blockSignals(True)
+    combo.clear()
+    combo.addItem(i18n.t("iface.default"))
+    for ip, name in interface_entries(family):
+        disp = f"{ip} ({name})" if name else ip
+        display_to_ip[disp] = ip
+        combo.addItem(disp)
+    if current:
+        disp = next((d for d, v in display_to_ip.items() if v == current), current)
+        combo.setCurrentText(disp)
+    combo.blockSignals(False)
+
+
 def _stat_tile(caption_key: str, min_h: int) -> tuple[QFrame, tuple[QLabel, QLabel]]:
     """Build one dashboard stat tile: caption on top, big value below."""
     frame = QFrame()
@@ -187,8 +241,11 @@ class ReceiveTab(QWidget):
         self._widgets: dict[str, QWidget] = {}
         # Stat tiles: key -> (caption label, value label)
         self._tiles: dict[str, tuple[QLabel, QLabel]] = {}
+        # Interface combo display-text ("ip (name)") -> plain IP
+        self._iface_map: dict[str, str] = {}
         self._build_ui()
         self._wire()
+        self._restore_settings()
 
     # -- build ------------------------------------------------------------- #
 
@@ -242,7 +299,9 @@ class ReceiveTab(QWidget):
         self.iface_combo = QComboBox()
         self.iface_combo.setEditable(True)
         self.version_combo = QComboBox()
-        self.group_edit = QLineEdit("224.0.0.1")
+        # Defaults pair up with the Send tab (239.1.1.1:5000 / ff3e::1:5000)
+        # so a first-run loopback test works without editing anything.
+        self.group_edit = QLineEdit("239.1.1.1")
         self.port_edit = QSpinBox(); self.port_edit.setRange(1, 65535); self.port_edit.setValue(5000)
         self.sources_edit = QLineEdit()
         self.add_btn = QPushButton()
@@ -403,6 +462,9 @@ class ReceiveTab(QWidget):
         hdr.sectionResized.connect(self._on_section_resized)
         self.table.installEventFilter(self)
         self.table.viewport().installEventFilter(self)
+        # Right-click menu on a row: reset counters / remove
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_table_menu)
         self._settings = QSettings("multicast-tool", "Multicast Test Tool")
         self._restore_header_state()
         tlay.addWidget(self.table)
@@ -450,6 +512,7 @@ class ReceiveTab(QWidget):
         self.bus.receiver_event.connect(self._on_receiver_event)
         self.remote_connect_btn.clicked.connect(self._on_remote_connect)
         self.remote_disconnect_btn.clicked.connect(self._on_remote_disconnect)
+        self.remote_addr_edit.returnPressed.connect(self._on_remote_connect)
 
     # -- translation ------------------------------------------------------ #
 
@@ -519,30 +582,27 @@ class ReceiveTab(QWidget):
     def _on_family_changed(self, _text: str) -> None:
         family = self._current_family()
         if family is AddressFamily.IPV4:
-            self.group_edit.setText("224.0.0.1")
+            self.group_edit.setText("239.1.1.1")
         else:
-            self.group_edit.setText("ff02::1")
+            self.group_edit.setText("ff3e::1")
         self._populate_interfaces(family)
         # Refresh version combo options
         self.retranslate_ui()
 
     def _populate_interfaces(self, family: AddressFamily) -> None:
-        current = self.iface_combo.currentText()
-        self.iface_combo.blockSignals(True)
-        self.iface_combo.clear()
-        self.iface_combo.addItem(i18n.t("iface.default"))
-        for ip in local_addresses(family):
-            self.iface_combo.addItem(ip)
-        if current and current != i18n.t("iface.default"):
-            self.iface_combo.setCurrentText(current)
-        self.iface_combo.blockSignals(False)
+        _fill_iface_combo(self.iface_combo, family, self._iface_map)
+
+    def _iface_value(self, text: str) -> str:
+        """Plain interface spec (IP or typed name) behind a combo display string."""
+        t = (text or "").strip()
+        return self._iface_map.get(t, t)
 
     def _on_add_clicked(self) -> None:
         try:
             family = self._current_family()
             group = self.group_edit.text().strip()
             port = int(self.port_edit.value())
-            iface = self.iface_combo.currentText().strip()
+            iface = self._iface_value(self.iface_combo.currentText())
             if iface == i18n.t("iface.default"):
                 iface = ""
             version_obj = self._current_version()
@@ -576,8 +636,9 @@ class ReceiveTab(QWidget):
         # Wire the event bridge *before* start() so the STARTED event (and
         # any early packets) are not lost to the race window.
         rcv.on_event = lambda ev, rid=row_id: self.bus.receiver_event.emit(rid, ev)
+        ts = time.strftime("%H:%M:%S")
         self._append_log(
-            f"{i18n.t('recv.add_group')}: {family.value} {group}:{port} "
+            f"[{ts}] {i18n.t('recv.add_group')}: {family.value} {group}:{port} "
             f"v{version_obj.value} iface={iface or i18n.t('iface.default')}"
         )
         row = ReceiverRow(
@@ -594,6 +655,8 @@ class ReceiveTab(QWidget):
             QMessageBox.critical(self, i18n.t("dlg.failed_start"), f"{e}\n{traceback.format_exc()}")
             return
         self._insert_table_row(row)
+        # Remember what worked so the next launch starts from here.
+        self.save_settings()
 
     def _on_remove_clicked(self) -> None:
         sel = self.table.currentRow()
@@ -626,8 +689,10 @@ class ReceiveTab(QWidget):
                 self, i18n.t("recv.btn_export_csv"), i18n.t("recv.csv_no_rows")
             )
             return
+        # Timestamped default name so consecutive exports never overwrite.
+        default_name = time.strftime("receive_stats_%Y%m%d_%H%M%S.csv")
         path, _flt = QFileDialog.getSaveFileName(
-            self, i18n.t("recv.btn_export_csv"), "receive_stats.csv",
+            self, i18n.t("recv.btn_export_csv"), default_name,
             "CSV (*.csv);;All files (*)",
         )
         if not path:
@@ -692,6 +757,65 @@ class ReceiveTab(QWidget):
             "receive_table_header", bytes(state.toBase64()).decode("ascii")
         )
         self._settings.setValue("receive_group_user_resized", self._group_user_resized)
+        # Form values: restore on the next launch so a repeat test starts
+        # one click away.
+        iface = self._iface_value(self.iface_combo.currentText())
+        if iface == i18n.t("iface.default"):
+            iface = ""
+        s = self._settings
+        s.setValue("recv/last_family", self._current_family().value)
+        s.setValue("recv/last_group", self.group_edit.text().strip())
+        s.setValue("recv/last_port", int(self.port_edit.value()))
+        s.setValue("recv/last_iface", iface)
+        s.setValue("recv/last_version", self._current_version().value)
+        s.setValue("recv/last_sources", self.sources_edit.text().strip())
+        s.setValue("recv/remote_addr", self.remote_addr_edit.text().strip())
+        s.setValue("recv/remote_interval", float(self.remote_interval.value()))
+        s.sync()
+
+    def _restore_settings(self) -> None:
+        s = self._settings
+        fam = next(
+            (f for f in AddressFamily
+             if f.value == str(s.value("recv/last_family", "") or "")),
+            None,
+        )
+        if fam is not None:
+            self.family_combo.blockSignals(True)
+            self.family_combo.setCurrentText(i18n.t(f"family.{fam.value.lower()}"))
+            self.family_combo.blockSignals(False)
+            # Rebuild the version combo / interface list for this family
+            # without triggering the group-address reset.
+            self.retranslate_ui()
+        group = str(s.value("recv/last_group", "") or "")
+        if group:
+            self.group_edit.setText(group)
+        port = _to_int(s.value("recv/last_port", 0), 0)
+        if 1 <= port <= 65535:
+            self.port_edit.setValue(port)
+        iface = str(s.value("recv/last_iface", "") or "")
+        if iface:
+            disp = next(
+                (d for d, v in self._iface_map.items() if v == iface), iface,
+            )
+            self.iface_combo.setCurrentText(disp)
+        ver = str(s.value("recv/last_version", "") or "")
+        if ver:
+            fam2 = fam if fam is not None else self._current_family()
+            versions = IgmpVersion if fam2 is AddressFamily.IPV4 else MldVersion
+            for v in versions:
+                if v.value == ver:
+                    self.version_combo.setCurrentText(i18n.t(f"ver.{v.value.lower()}"))
+                    break
+        sources = str(s.value("recv/last_sources", "") or "")
+        if sources:
+            self.sources_edit.setText(sources)
+        raddr = str(s.value("recv/remote_addr", "") or "")
+        if raddr:
+            self.remote_addr_edit.setText(raddr)
+        rint = _to_float(s.value("recv/remote_interval", 0.0), 0.0)
+        if 0.2 <= rint <= 60.0:
+            self.remote_interval.setValue(rint)
 
     # -- table mechanics -------------------------------------------------- #
 
@@ -703,7 +827,21 @@ class ReceiveTab(QWidget):
             watched is self.table or watched is self.table.viewport()
         ):
             self._refill_group_column()
+        # Delete removes the selected membership (same as the button).
+        if (event.type() == QEvent.KeyPress
+                and watched is self.table.viewport()
+                and event.key() == Qt.Key_Delete):
+            self._on_remove_clicked()
+            return True
         return super().eventFilter(watched, event)
+
+    def _show_table_menu(self, pos) -> None:
+        if self.table.currentRow() < 0:
+            return
+        menu = QMenu(self.table)
+        menu.addAction(i18n.t("recv.btn_reset_counters"), self._on_clear_counters_clicked)
+        menu.addAction(i18n.t("recv.btn_remove"), self._on_remove_clicked)
+        _menu_exec(menu, self.table.viewport().mapToGlobal(pos))
 
     def _on_section_resized(self, index: int, old: int, new: int) -> None:
         if self._suppress_resize_signal:
@@ -814,6 +952,7 @@ class ReceiveTab(QWidget):
         self.remote_disconnect_btn.setEnabled(True)
         self.remote_status_value.setText(i18n.t("recv.remote_status_connecting"))
         self._append_log(f"remote sender: {addr} ({interval}s)")
+        self.save_settings()
 
     def _on_remote_disconnect(self) -> None:
         poller, self.state.remote_poller = self.state.remote_poller, None
@@ -937,8 +1076,15 @@ class SendTab(QWidget):
         self._widgets: dict[str, QWidget] = {}
         self._tiles: dict[str, tuple[QLabel, QLabel]] = {}
         self._form_labels: list[QLabel] = []   # send-parameter form labels
+        # Interface combo display-text ("ip (name)") -> plain IP
+        self._iface_map: dict[str, str] = {}
+        # Final stats of the last finished send, kept on the tiles until
+        # the next start (a short burst usually completes between ticks).
+        self._last_snap: Optional[StatsSnapshot] = None
+        self._settings = QSettings("multicast-tool", "Multicast Test Tool")
         self._build_ui()
         self._wire()
+        self._restore_settings()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -1214,15 +1360,12 @@ class SendTab(QWidget):
         self._populate_ifaces(family)
 
     def _populate_ifaces(self, family: AddressFamily) -> None:
-        current = self.s_iface.currentText()
-        self.s_iface.blockSignals(True)
-        self.s_iface.clear()
-        self.s_iface.addItem(i18n.t("iface.default"))
-        for ip in local_addresses(family):
-            self.s_iface.addItem(ip)
-        if current and current != i18n.t("iface.default"):
-            self.s_iface.setCurrentText(current)
-        self.s_iface.blockSignals(False)
+        _fill_iface_combo(self.s_iface, family, self._iface_map)
+
+    def _iface_value(self, text: str) -> str:
+        """Plain interface spec (IP or typed name) behind a combo display string."""
+        t = (text or "").strip()
+        return self._iface_map.get(t, t)
 
     def _on_mode_changed(self, _text: str) -> None:
         cur = self.s_mode.currentText()
@@ -1245,7 +1388,7 @@ class SendTab(QWidget):
             family = self._current_family()
             group = self.s_group.text().strip()
             port = int(self.s_port.value())
-            iface = self.s_iface.currentText().strip()
+            iface = self._iface_value(self.s_iface.currentText())
             if iface == i18n.t("iface.default"):
                 iface = ""
             source = self.s_source.text().strip()
@@ -1284,6 +1427,7 @@ class SendTab(QWidget):
             QMessageBox.critical(self, i18n.t("dlg.failed_start"), f"{e}\n{traceback.format_exc()}")
             return
         self.state.sender = sender
+        self._last_snap = None   # clear the previous run's final stats
         self.s_status.setText(i18n.t("send.status_running"))
         self.s_start.setEnabled(False)
         self.s_stop.setEnabled(True)
@@ -1292,17 +1436,25 @@ class SendTab(QWidget):
             family=family.value, group=group, port=port, mode=mode.value,
             ttl=ttl, dscp=dscp, payload=payload_size,
         ))
+        # Remember what worked so the next launch starts from here.
+        self.save_settings()
         # If a stats exporter is running, rebuild its provider
         self._refresh_exporter_provider()
 
     def _on_stop_clicked(self) -> None:
         if self.state.sender is None:
             return
-        sent = self.state.sender.sent_count()
-        self.state.sender.stop()
+        sender = self.state.sender
+        sent = sender.sent_count()
+        # stop() emits STOPPED synchronously; its handler grabs the final
+        # snapshot and sets the done status.
+        sender.stop()
+        try:
+            self._last_snap = sender.stats.snapshot()
+        except Exception:  # noqa: BLE001
+            logger.exception("final send snapshot")
         self.state.sender = None
         self._append_log(i18n.t("send.log_stopped").format(sent=sent))
-        self.s_status.setText(i18n.t("send.status_idle"))
         self.s_start.setEnabled(True)
         self.s_stop.setEnabled(False)
         self._refresh_exporter_provider()
@@ -1313,12 +1465,16 @@ class SendTab(QWidget):
             self._append_log(f"[{ts}] {event.message}")
         elif event.type is SenderEventType.STOPPED:
             self._append_log(f"[{ts}] {event.message}")
-            self.s_status.setText(i18n.t("send.status_idle"))
             self.s_start.setEnabled(True)
             self.s_stop.setEnabled(False)
+            self.s_status.setText(i18n.t("send.status_done").format(n=event.sent or 0))
             if self.state.sender is not None:
                 # Natural completion: drop the reference so the stats
                 # exporter reports 'idle' instead of a frozen 'running'.
+                try:
+                    self._last_snap = self.state.sender.stats.snapshot()
+                except Exception:  # noqa: BLE001
+                    logger.exception("final send snapshot")
                 if event.sent and self.state.sender.last_error is None:
                     self.s_progress.setValue(100)
                 self.state.sender = None
@@ -1341,10 +1497,22 @@ class SendTab(QWidget):
     # -- live send stats (tiles) ------------------------------------------ #
 
     def refresh_stats(self) -> None:
-        """Update the send-tab stat tiles from the active sender, if any."""
+        """Update the send-tab stat tiles from the active sender, if any.
+
+        After a send finishes the last snapshot stays on screen until the
+        next start -- a burst often completes between refresh ticks, and
+        the final numbers are what the user wants to read.
+        """
         sender = self.state.sender
         if sender is not None and sender.is_running():
             snap = sender.stats.snapshot()
+            self._last_snap = snap
+        else:
+            snap = self._last_snap
+        if snap is None:
+            values = ("0", "0.00 B", "0.0", "--")
+            _set_label_color(self._tiles["send.tile.rate"][1], _color_for_pps(0.0))
+        else:
             values = (
                 f"{snap.total_packets:,}",
                 format_bytes(snap.total_bytes),
@@ -1352,9 +1520,6 @@ class SendTab(QWidget):
                 _format_elapsed(snap.elapsed_sec),
             )
             _set_label_color(self._tiles["send.tile.rate"][1], _color_for_pps(snap.pps))
-        else:
-            values = ("0", "0.00 B", "0.0", "--")
-            _set_label_color(self._tiles["send.tile.rate"][1], _color_for_pps(0.0))
         for key, text in zip(self.TILE_KEYS, values):
             self._tiles[key][1].setText(text)
 
@@ -1377,6 +1542,7 @@ class SendTab(QWidget):
         self._refresh_exporter_endpoint_hint()
         self.exp_start.setEnabled(False)
         self.exp_stop.setEnabled(True)
+        self.save_settings()
         self._append_log(f"stats-exporter: listening on {bind}:{port}")
 
     def _on_exporter_stop(self) -> None:
@@ -1453,6 +1619,94 @@ class SendTab(QWidget):
             }
         return provider
 
+    # -- settings persistence -------------------------------------------- #
+
+    def save_settings(self) -> None:
+        s = self._settings
+        iface = self._iface_value(self.s_iface.currentText())
+        if iface == i18n.t("iface.default"):
+            iface = ""
+        mode = next(
+            (m for m in SenderMode
+             if self.s_mode.currentText() in (m.value, i18n.t(f"mode.{m.value}"))),
+            SenderMode.BURST,
+        )
+        s.setValue("send/last_family", self._current_family().value)
+        s.setValue("send/last_group", self.s_group.text().strip())
+        s.setValue("send/last_port", int(self.s_port.value()))
+        s.setValue("send/last_iface", iface)
+        s.setValue("send/last_source", self.s_source.text().strip())
+        s.setValue("send/last_ttl", int(self.s_ttl.value()))
+        s.setValue("send/last_dscp", int(self.s_dscp.value()))
+        s.setValue("send/last_payload", int(self.s_payload.value()))
+        s.setValue("send/last_mode", mode.value)
+        s.setValue("send/last_count", int(self.s_count.value()))
+        s.setValue("send/last_rate", int(self.s_rate.value()))
+        s.setValue("send/last_template", self.s_template.isChecked())
+        s.setValue("send/last_template_text", self.s_template_text.text())
+        s.setValue("send/last_export_port", int(self.exp_port.value()))
+        s.setValue("send/last_export_bind_net", self.exp_bind_net.isChecked())
+        s.sync()
+
+    def _restore_settings(self) -> None:
+        s = self._settings
+        fam = next(
+            (f for f in AddressFamily
+             if f.value == str(s.value("send/last_family", "") or "")),
+            None,
+        )
+        if fam is not None:
+            self.s_family.blockSignals(True)
+            self.s_family.setCurrentText(i18n.t(f"family.{fam.value.lower()}"))
+            self.s_family.blockSignals(False)
+            # Rebuild the interface list for this family without
+            # triggering the group-address reset.
+            self.retranslate_ui()
+        group = str(s.value("send/last_group", "") or "")
+        if group:
+            self.s_group.setText(group)
+        port = _to_int(s.value("send/last_port", 0), 0)
+        if 1 <= port <= 65535:
+            self.s_port.setValue(port)
+        iface = str(s.value("send/last_iface", "") or "")
+        if iface:
+            disp = next((d for d, v in self._iface_map.items() if v == iface), iface)
+            self.s_iface.setCurrentText(disp)
+        source = str(s.value("send/last_source", "") or "")
+        if source:
+            self.s_source.setText(source)
+        ttl = _to_int(s.value("send/last_ttl", -1), -1)
+        if 0 <= ttl <= 255:
+            self.s_ttl.setValue(ttl)
+        dscp = _to_int(s.value("send/last_dscp", -1), -1)
+        if 0 <= dscp <= 63:
+            self.s_dscp.setValue(dscp)
+        payload = _to_int(s.value("send/last_payload", -1), -1)
+        if 0 <= payload <= 65507:
+            self.s_payload.setValue(payload)
+        mode = str(s.value("send/last_mode", "") or "")
+        if mode:
+            for m in SenderMode:
+                if m.value == mode:
+                    self.s_mode.setCurrentText(i18n.t(f"mode.{m.value}"))
+                    break
+        count = _to_int(s.value("send/last_count", 0), 0)
+        if count >= 1:
+            self.s_count.setValue(count)
+        rate = _to_int(s.value("send/last_rate", 0), 0)
+        if rate >= 1:
+            self.s_rate.setValue(rate)
+        if _to_bool(s.value("send/last_template", False)):
+            self.s_template.setChecked(True)
+        ttext = str(s.value("send/last_template_text", "") or "")
+        if ttext:
+            self.s_template_text.setText(ttext)
+        eport = _to_int(s.value("send/last_export_port", 0), 0)
+        if 1 <= eport <= 65535:
+            self.exp_port.setValue(eport)
+        if _to_bool(s.value("send/last_export_bind_net", False)):
+            self.exp_bind_net.setChecked(True)
+
     # -- shutdown -------------------------------------------------------- #
 
     def shutdown(self) -> None:
@@ -1494,6 +1748,9 @@ class MainWindow(QMainWindow):
         # declaring a smaller floor let windows shrink into a state where
         # labels and the receive table were clipped.
         self.setMinimumSize(1208, 800)
+        # Window geometry survives restarts (size / position / maximized).
+        self._settings = QSettings("multicast-tool", "Multicast Test Tool")
+        self._restore_geometry()
 
         # Status bar
         sb = QStatusBar()
@@ -1589,9 +1846,27 @@ class MainWindow(QMainWindow):
             self, i18n.t("about.title"), i18n.t("about.body")
         )
 
+    def _restore_geometry(self) -> None:
+        geo = self._settings.value("ui/geometry")
+        if not geo:
+            return
+        try:
+            if isinstance(geo, str):
+                geo = QByteArray.fromBase64(geo.encode("ascii"))
+            elif isinstance(geo, (bytes, bytearray)):
+                geo = QByteArray(bytes(geo))
+            self.restoreGeometry(geo)
+        except Exception:  # noqa: BLE001 - a stale blob must not block startup
+            logger.debug("Failed to restore window geometry", exc_info=True)
+
     def closeEvent(self, ev) -> None:  # noqa: N802
         try:
+            self._settings.setValue(
+                "ui/geometry",
+                bytes(self.saveGeometry().toBase64()).decode("ascii"),
+            )
             self.recv_tab.save_settings()
+            self.send_tab.save_settings()
         except Exception:  # noqa: BLE001
             logger.exception("save settings")
         for row in list(self.state.receivers.values()):

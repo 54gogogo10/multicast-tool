@@ -21,7 +21,7 @@ try:
     from PySide6.QtWidgets import (
         QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
         QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
-        QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+        QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
         QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QSplitter,
         QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
         QWidget,
@@ -35,9 +35,9 @@ except ImportError:  # PySide2 / Win7 build
         QAbstractItemView, QAction, QApplication, QCheckBox, QComboBox,
         QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout,
         QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
-        QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox,
-        QSplitter, QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget,
-        QVBoxLayout, QWidget,
+        QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+        QSpinBox, QSplitter, QStatusBar, QTableWidget, QTableWidgetItem,
+        QTabWidget, QVBoxLayout, QWidget,
     )
     PYSIDE_VERSION = 2
 
@@ -47,7 +47,7 @@ __all__ = [
     "QAction", "QColor", "QFont", "QKeySequence", "QPalette",
     "QAbstractItemView", "QApplication", "QCheckBox", "QComboBox", "QDoubleSpinBox",
     "QFileDialog", "QFormLayout", "QFrame", "QGridLayout", "QGroupBox", "QHBoxLayout", "QHeaderView",
-    "QLabel", "QLineEdit", "QMainWindow", "QMessageBox", "QPlainTextEdit",
+    "QLabel", "QLineEdit", "QMainWindow", "QMenu", "QMessageBox", "QPlainTextEdit",
     "QProgressBar", "QPushButton", "QSpinBox", "QSplitter", "QStatusBar",
     "QTableWidget", "QTableWidgetItem", "QTabWidget", "QVBoxLayout", "QWidget",
     "PYSIDE_VERSION", "exec_app",

@@ -47,7 +47,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "recv.add_version": "协议版本:",
         "recv.add_sources": "源 (用于 v3 SSM):",
         "recv.add_btn": "添加并开始",
-        "recv.placeholder_group": "例如 224.0.0.1 或 ff02::1",
+        "recv.placeholder_group": "例如 239.1.1.1 或 ff3e::1（与发送页默认一致）",
         "recv.placeholder_sources": "可选，逗号分隔 (用于 IGMPv3/MLDv2 SSM)",
         "recv.active": "活跃的组成员",
         "recv.btn_remove": "移除选中",
@@ -110,6 +110,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "send.status": "状态:",
         "send.status_idle": "空闲",
         "send.status_running": "发送中",
+        "send.status_done": "完成（已发送 {n} 包）",
         # Stat tiles (send)
         "send.tile.sent": "已发送",
         "send.tile.bytes": "发送字节",
@@ -196,7 +197,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "recv.add_version": "Protocol version:",
         "recv.add_sources": "Sources (v3 SSM):",
         "recv.add_btn": "Add && Start",
-        "recv.placeholder_group": "e.g. 224.0.0.1 or ff02::1",
+        "recv.placeholder_group": "e.g. 239.1.1.1 or ff3e::1 (matches the Send tab default)",
         "recv.placeholder_sources": "optional, comma-separated (used with IGMPv3/MLDv2 SSM)",
         "recv.active": "Active memberships",
         "recv.btn_remove": "Remove Selected",
@@ -259,6 +260,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "send.status": "Status:",
         "send.status_idle": "Idle",
         "send.status_running": "Running",
+        "send.status_done": "Done ({n} packets sent)",
         # Stat tiles (send)
         "send.tile.sent": "Sent",
         "send.tile.bytes": "Sent bytes",
@@ -331,11 +333,16 @@ def t(key: str) -> str:
 
 
 def set_language(lang: str) -> None:
-    """Switch the current language. Unknown languages are ignored."""
+    """Switch the current language. Unknown languages are ignored.
+
+    The choice is persisted (best effort) so the next launch starts in
+    the same language.
+    """
     global _current_lang
     if lang in STRINGS:
         if _current_lang != lang:
             _current_lang = lang
+            _save_language(lang)
             for cb in list(_listeners):
                 try:
                     cb(lang)
@@ -356,3 +363,34 @@ def add_listener(cb: Callable[[str], None]) -> None:
 def remove_listener(cb: Callable[[str], None]) -> None:
     if cb in _listeners:
         _listeners.remove(cb)
+
+
+# ---- Persistence ----------------------------------------------------------- #
+
+
+def load_saved_language() -> str:
+    """Read the persisted language preference (default: ``zh_CN``).
+
+    Call once at startup, before the first window is built, and feed the
+    result to :func:`set_language`.
+    """
+    try:
+        from .qt_compat import QSettings
+
+        val = QSettings("multicast-tool", "Multicast Test Tool").value(
+            "ui/language", "zh_CN"
+        )
+        return val if val in STRINGS else "zh_CN"
+    except Exception:  # noqa: BLE001 - never block startup on settings
+        return "zh_CN"
+
+
+def _save_language(lang: str) -> None:
+    try:
+        from .qt_compat import QSettings
+
+        s = QSettings("multicast-tool", "Multicast Test Tool")
+        s.setValue("ui/language", lang)
+        s.sync()
+    except Exception:  # noqa: BLE001
+        pass
